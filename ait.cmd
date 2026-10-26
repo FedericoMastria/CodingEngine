@@ -7,7 +7,7 @@ rem spaces, so an unquoted > | & in an argument becomes a redirection/pipe BEFOR
 setlocal
 where uv >nul 2>&1
 if %errorlevel%==0 (
-    uv run --no-project --quiet --python ">=3.12" "%~dp0ai_router.py" --ait %*
+    uv run --no-project --quiet --python ">=3.14" "%~dp0ai_router.py" --ait %*
 ) else (
     python "%~dp0ai_router.py" --ait %*
 )

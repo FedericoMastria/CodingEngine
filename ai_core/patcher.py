@@ -107,11 +107,17 @@ def apply_blocks(originals: dict[str, str | None], blocks: list[EditBlock]) -> d
     if not blocks:
         raise PatchError("no SEARCH/REPLACE blocks in model output")
     # Windows: model may write `Src\Calc.py` for `src/calc.py`. Exact allow-list lookup, no traversal.
-    lookup = {k.replace("\\", "/").lower(): k for k in originals}
+    # Exact spelling first (WSL files may differ only by case); case-folding only if it names ONE target.
+    exact = {k.replace("\\", "/"): k for k in originals}
+    folded: dict[str, list[str]] = {}
+    for k in originals:
+        folded.setdefault(k.replace("\\", "/").lower(), []).append(k)
     work: dict[str, str] = {}
     crlf: dict[str, bool] = {}
     for block in blocks:
-        path = lookup.get(block.path.replace("\\", "/").removeprefix("./").lower())
+        wanted = block.path.replace("\\", "/").removeprefix("./")
+        matches = folded.get(wanted.lower(), [])
+        path = exact.get(wanted) or (matches[0] if len(matches) == 1 else None)
         if path is None:
             raise OutsideTargetError(block.path, list(originals))
         if path not in work:

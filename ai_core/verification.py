@@ -19,10 +19,12 @@ from pathlib import Path
 from ai_core import TaskStatus, kill_process_tree
 from ai_core.config import CONTEXT_DIR_NAME, Config
 from ai_core.security import sanitize_subprocess_env
+from ai_core.wsl import project_argv, wsl_python, wsl_target
 
 PASSED, FAILED, TIMEOUT, SKIPPED = "passed", "failed", "timeout", "skipped"
 _OUTPUT_TAIL = 4000
 _WIN_COMMAND_NOT_FOUND = 9009  # cmd.exe / Microsoft Store `python` alias when not installed
+_POSIX_COMMAND_NOT_FOUND = 127  # sh inside a WSL distro
 # pytest "FAILED tests/x.py::t - ...", unittest "FAIL: test_x (mod.Cls.test_x)".
 # Ids starting with "(" are summary counters ("FAILED (failures=2)"), not tests.
 _TEST_ID = re.compile(r"^(?:FAILED|ERROR|FAIL)[: ]\s*([^\s(]\S*(?: \([\w.]+\))?)", re.M)
@@ -54,7 +56,7 @@ class VerificationResult:
 def _run(cmd: Sequence[str], cwd: Path, timeout_s: int, level: int) -> LevelResult:
     try:
         proc = subprocess.Popen(
-            list(cmd), cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            project_argv(cwd, cmd), cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             encoding="utf-8", errors="replace", env=sanitize_subprocess_env(os.environ, warn=False),
         )
     except (FileNotFoundError, PermissionError) as exc:  # missing tool, WinError 5 on the executable
@@ -68,8 +70,8 @@ def _run(cmd: Sequence[str], cwd: Path, timeout_s: int, level: int) -> LevelResu
     output = (output or "")[-_OUTPUT_TAIL:]
     if proc.returncode == 0:
         return LevelResult(level, PASSED, output=output)
-    if proc.returncode == _WIN_COMMAND_NOT_FOUND:
-        return LevelResult(level, SKIPPED, output=f"command unavailable (exit 9009): {cmd[0]}")
+    if proc.returncode in ((_WIN_COMMAND_NOT_FOUND, _POSIX_COMMAND_NOT_FOUND) if wsl_target(cwd) else (_WIN_COMMAND_NOT_FOUND,)):
+        return LevelResult(level, SKIPPED, output=f"command unavailable (exit {proc.returncode}): {cmd[0]}")
     ids = set(_TEST_ID.findall(output)) | {f"{p.replace(chr(92), '/')}:{code}" for p, code in _TSC_ERROR.findall(output)}
     return LevelResult(level, FAILED, frozenset(ids), output)
 
@@ -130,6 +132,8 @@ def find_targeted_tests(files: Iterable[Path], root: Path, cfg: Config) -> list[
 def default_l2_command(root: Path) -> list[str]:
     """`tsc --noEmit` for TypeScript projects with a local TypeScript install; [] otherwise (never npx: no downloads)."""
     tsc = root / "node_modules" / "typescript" / "bin" / "tsc"
+    if wsl_target(root):  # Linux node inside the distro; Windows `node` and absolute UNC paths would not work there
+        return ["node", "node_modules/typescript/bin/tsc", "--noEmit"] if tsc.is_file() and (root / "tsconfig.json").is_file() else []
     node = shutil.which("node")
     return [node, str(tsc), "--noEmit"] if node and tsc.is_file() and (root / "tsconfig.json").is_file() else []
 
@@ -140,7 +144,10 @@ def _run_levels(root: Path, cfg: Config, files: list[Path]) -> dict[int, LevelRe
     levels[2] = (_run(l2, root, cfg.verify_l2_timeout_s, 2) if l2
                  else LevelResult(2, SKIPPED, output="verify_l2_command not configured"))
     tests = find_targeted_tests(files, root, cfg)
-    levels[3] = (_run([*cfg.verify_l3_command, *tests], root, cfg.verify_l3_timeout_s, 3) if tests
+    l3 = cfg.verify_l3_command
+    if wsl_target(root) and l3[:1] == ["python"]:
+        l3 = [wsl_python(root), *l3[1:]]
+    levels[3] = (_run([*l3, *tests], root, cfg.verify_l3_timeout_s, 3) if tests
                  else LevelResult(3, SKIPPED, output="no targeted tests found"))
     return levels
 

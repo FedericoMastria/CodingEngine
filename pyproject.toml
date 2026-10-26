@@ -6,7 +6,7 @@
 name = "codingengine"
 version = "1.0.0"
 description = "Local-first multi-CLI AI orchestrator and router for Windows 11"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = ["rich>=13", "prompt_toolkit>=3"]  # REPL TUI only (ai_core/tui.py); falls back to input() without them
 
 [project.scripts]

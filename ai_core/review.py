@@ -19,6 +19,7 @@ from ai_core.credit import AVAILABLE, CreditManager
 from ai_core.router import OllamaError, TaskOptions, _exec_options, ollama_chat
 from ai_core.security import is_secret_file, require_cloud_allowed, sanitize_subprocess_env
 from ai_core.session import ProjectLock, blackboard_context, load_blackboard
+from ai_core.wsl import project_argv
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 _MAX_UNTRACKED_BYTES = 512 * 1024
@@ -44,7 +45,7 @@ class ReviewError(RuntimeError):
 
 
 def _git(root: Path, *args: str) -> str:
-    cp = subprocess.run(["git", "-c", "core.quotepath=off", *args], cwd=root, capture_output=True,
+    cp = subprocess.run(project_argv(root, ["git", "-c", "core.quotepath=off", *args]), cwd=root, capture_output=True,
                         encoding="utf-8", errors="replace", env=sanitize_subprocess_env(os.environ, warn=False))
     if cp.returncode != 0:
         raise ReviewError(f"git {' '.join(args)}: {cp.stderr.strip()}")
@@ -55,8 +56,9 @@ def collect_diff(root: Path, cfg: Config) -> list[tuple[str, str]]:
     """[(path, diff)] for `git diff HEAD` plus untracked non-ignored text files. Secrets are withheld."""
     if git_toplevel(root) is None:
         raise ReviewError("--review needs a Git repository")
-    head = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=root, capture_output=True,
-                          encoding="utf-8", errors="replace").stdout.strip() or EMPTY_TREE
+    head = subprocess.run(project_argv(root, ["git", "rev-parse", "--verify", "-q", "HEAD"]), cwd=root, capture_output=True,
+                          encoding="utf-8", errors="replace",
+                          env=sanitize_subprocess_env(os.environ, warn=False)).stdout.strip() or EMPTY_TREE
     out: list[tuple[str, str]] = []
     for chunk in _git(root, "diff", "--no-color", "--no-ext-diff", head, "--", ".").split("\ndiff --git ")[0:]:
         if not chunk.strip():

@@ -1,14 +1,14 @@
 # CodingEngine — Project Instructions for Claude Code
 
 ## Project Overview
-CodingEngine is a dual-channel, local/cloud orchestrator and CLI router native for Windows 11.
+CodingEngine is a dual-channel, local/cloud orchestrator and CLI router native for Windows 11 (Python 3.14). It also drives projects that live in WSL (`\\wsl.localhost\<distro>\...`): see `ai_core/wsl.py`.
 Full architecture specification: [CodingEngineArchitecture_v1.0.md](CodingEngineArchitecture_v1.0.md) (v1.0). **Delivered and verified features: §14.B. Open checks: §14.C. Approved divergences from v0.9 baseline: §14.A.**
 
 ## Non-Negotiable Invariants
 1. **Invariant #1 (`--offline` Absolute):** When `--offline` is set, cloud channels are physically disabled. No token overflow or Ollama failure can touch the network.
 2. **Invariant #2 & #3 (Data Safety & External Checkpoints):** Checkpoints and snapshots (plain copies, no `.zst`) are NEVER written inside the workspace; they live in `~/.ai_checkpoints/<project_hash>/<checkpoint_id>/`. Never overwrite user changes; safe undo targets only `touched_files` with pre/post SHA verification.
 3. **Invariant #5 (Zero API Billing):** Subprocesses invoking cloud CLIs MUST sanitize `os.environ`, stripping `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`.
-4. **Windows Native:** Handle path case-insensitivity (`path.lower()`), backslashes, `WinError 5` (Access Denied), and `WinError 32` (File in Use). Primary target syntax is `+file` to prevent PowerShell splatting.
+4. **Windows Native:** Handle path case-insensitivity (compare via `security.path_key` / `wsl.project_key`, never bare `.lower()`: WSL projects are case-sensitive), backslashes, `WinError 5` (Access Denied), and `WinError 32` (File in Use). Primary target syntax is `+file` to prevent PowerShell splatting.
 5. **Claude CLI Integration:** Non-interactive calls use `claude -p`. When `--output-format stream-json` is used, `--verbose` is MANDATORY (otherwise exit code 1).
 
 ## Engineering Principles (Ponytail & Superpowers)
@@ -28,6 +28,7 @@ Full architecture specification: [CodingEngineArchitecture_v1.0.md](CodingEngine
 - `ai_core/session.py`: Blackboard I/O, `pending_sessions` (`ai -c`), single-task lock (PID-reuse safe).
 - `ai_core/adr.py`: ADR lifecycle (`proposed` / `active` / `rejected`, source tracking).
 - `ai_core/repomap.py`: AST repo-map with import-graph PageRank and incremental cache.
+- `ai_core/wsl.py`: WSL mode. `wsl_target`/`canonical_root` detect and normalise `\\wsl.localhost` paths; `project_argv` runs every *project* command (git, L2/L3 verification, `ait`, vault chmod, and Claude itself) inside the distro via `wsl.exe -d <distro> --cd <dir> -e`; `linux_claude` finds the distro's `claude`. `agy` and Ollama stay Windows processes.
 - `ai_core/vault.py`: Same-volume NTFS vault for secret files (Channel B), journal + `ai --recover`.
 - `ai_core/patcher.py`: Atomic 2-stage SEARCH/REPLACE for the local branch.
 - `ai_core/review.py`, `commit.py`, `runner.py`: `--review`, `--commit`, `ait` / `--fix`.
@@ -44,4 +45,6 @@ Full architecture specification: [CodingEngineArchitecture_v1.0.md](CodingEngine
 - Cold start of `qwen3.6:35b-a3b`: ~49-54 s load + ~20 s warm-up; a client timeout aborts the load.
 - Benchmark (`ai --benchmark` → `~/.ai_benchmark.json`): prefill 686 tok/s @1.7k → 325 @21k, gen 59 → 26 tok/s, ~3.7 chars/token. Prefill is ~4x slower than first assumed: never raise `scoring_full_content_max_tokens` without re-measuring.
 - Ollama server env is checked from the `server config` line of `%LOCALAPPDATA%\Ollama\server.log` (`ai_core/ollama_env.py`), not from our own environment. Required: FLASH_ATTENTION=1, KV_CACHE_TYPE=q8_0, KEEP_ALIVE=-1, NUM_PARALLEL=1 (user env vars set 2026-10-25).
+- WSL mode (2026-10-26): inside `wsl.exe -e` PATH has `python3` but no `python`; `.venv` is probed in the distro (`test -x`) because a symlinked venv is dangling from Windows. Git for Windows ships its own `sh.exe`, so tests must prove a command ran in the distro (`uname -r` contains `microsoft`). Git Bash rewrites `/home/...` arguments into Windows paths: wrap Linux commands in `sh -c`. `st_dev` is 0 on every UNC share.
+- Cloud on WSL projects (2026-10-26): `claude -p` with a `\\wsl.localhost` cwd reads files but its Edit is ALWAYS denied (probed: --add-dir, forward slashes, `\\wsl$`, blanket --allowedTools Edit). So Channel A runs the distro's own `claude` (`ClaudeAdapter._launch` -> `wsl.exe ... -e env -u <API keys> <path> ...`; the path comes from `wsl.linux_claude`, a login shell, because `wsl.exe -e` has a bare PATH without `~/.local/bin`). `agy` with a UNC cwd answers "Authentication required" (same command and env work from a Windows folder), so Channel B starts it in `~/.ai_agy_cwd` with `--add-dir <project>` and a note giving the project root (relative paths in the task are resolved against it). `wsl.exe -e` passes multi-line / 22 KB / quoted arguments byte-exact. The distro's claude was checked on the stream (not the credential files): `apiKeySource: none`, 5h/7d rate-limit windows, overage disabled = Pro subscription, not API billing; it has no statusLine hook, so `~/.ai_usage/claude.json` is not refreshed by WSL runs.
 - Context7 MCP: `ai --install-mcp` → pinned `@upstash/context7-mcp@4.3.0` in `~/.ai_mcp/context7` (`ai_core/mcp.py`); `--strict-mcp-config` on Claude calls when the project has secret files.

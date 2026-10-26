@@ -25,6 +25,7 @@ from ai_core.checkpoint import write_json_atomic
 from ai_core.config import CONTEXT_DIR_NAME, Config, ensure_context_dir
 from ai_core.router import TaskOptions, emit, run, say
 from ai_core.security import is_within, sanitize_subprocess_env
+from ai_core.wsl import project_argv, wsl_target
 
 LAST_ERROR_FILE = "last_terminal_error.json"
 _TAIL_CHARS = 64 * 1024
@@ -58,7 +59,7 @@ def run_tracked(root: Path, argv: list[str], *, stdout_to_stderr: bool = False) 
     out_tail: deque[str] = deque(maxlen=2000)
     err_tail: deque[str] = deque(maxlen=2000)
     try:
-        proc = subprocess.Popen(resolve_command(argv), cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        proc = subprocess.Popen(project_argv(root, argv) if wsl_target(root) else resolve_command(argv), cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 encoding="utf-8", errors="replace", env=sanitize_subprocess_env(os.environ, warn=False))
     except (FileNotFoundError, PermissionError) as exc:  # missing tool / WinError 5
         code, out, err = 127, "", f"cannot run {argv[0]}: {exc}"

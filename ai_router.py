@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # importable from any 
 
 from ai_core import ExitCode
 from ai_core.config import ConfigError, find_project_root, load_config
+from ai_core.wsl import WslError, canonical_root, wsl_target
 
 _TRAILING_PUNCT = ",;:)]}'\""
 # ai's own flags allowed right after --fix; the first other token starts the command line.
@@ -197,6 +198,7 @@ def run_repl(root: Path, cfg: Any, args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     os.environ["PYTHONUTF8"] = "1"  # W03: inherited by child Python processes
+    os.environ["WSL_UTF8"] = "1"  # wsl.exe prints its own messages as UTF-16 otherwise
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):  # absent on redirected StringIO streams
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -214,18 +216,34 @@ def main(argv: list[str] | None = None) -> int:
             j += 1
         tracked, argv = argv[j:], argv[:i] + argv[i:j]
     args = build_parser().parse_args(argv)
-    if args.dir:
-        dir_path = Path(args.dir).resolve()
-        if not dir_path.is_dir():
-            print(f"✖ --dir directory not found: {args.dir}", file=sys.stderr)
-            return ExitCode.USAGE
-        root = dir_path
-    else:
-        root = find_project_root(Path.cwd())
+    try:
+        if args.dir:
+            dir_path = canonical_root(Path(args.dir).resolve())  # resolve first: `--dir .` from a \\wsl$ cwd
+            if not dir_path.is_dir():
+                print(f"✖ --dir directory not found: {args.dir}", file=sys.stderr)
+                return ExitCode.USAGE
+            root = dir_path
+        else:
+            root = canonical_root(find_project_root(Path.cwd()))
+    except WslError as exc:
+        print(f"✖ {exc}", file=sys.stderr)
+        return ExitCode.USAGE
+    if os.path.normcase(os.path.normpath(root)) == os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows")):
+        print("✖ cmd.exe cannot run in a UNC folder (it fell back to C:\\Windows): use ai.exe, "
+              "or pass --dir \\\\wsl.localhost\\...", file=sys.stderr)
+        return ExitCode.USAGE
+    if args.verbose and (target := wsl_target(root)):
+        print(f"→ WSL: {target.distro}:{target.linux_path}", file=sys.stderr)
     try:
         cfg = load_config(root)
     except ConfigError as exc:
         print(f"✖ {exc}", file=sys.stderr)
+        return ExitCode.FAILED
+    from ai_core.checkpoint import git_refusal
+    # --recover must never wait on Git: it puts the user's secret files back. --status/--usage only report.
+    if not (args.recover or args.status or args.usage) and (refusal := git_refusal(root)):
+        print(f"✖ Git refuses this repository, so checkpoints, undo, --review and --commit would run without it.\n"
+              f"{refusal}", file=sys.stderr)
         return ExitCode.FAILED
 
     from ai_core import router  # after config validation

@@ -20,6 +20,7 @@ from ai_core import estimate_tokens
 from ai_core.checkpoint import file_sha256, git_toplevel, write_json_atomic
 from ai_core.config import CONTEXT_DIR_NAME, Config
 from ai_core.security import is_secret_file, is_within, sanitize_subprocess_env
+from ai_core.wsl import project_argv
 
 INDEX_FILE, MAP_FILE = "repo_map_index.json", "repo_map.txt"
 _INDEX_VERSION = 1
@@ -162,8 +163,9 @@ def list_project_files(root: Path, cfg: Config) -> list[str]:
     excluded = {d.lower() for d in cfg.checkpoint_exclude_dirs} | {".git", CONTEXT_DIR_NAME}
     rels: list[str] = []
     if git_toplevel(root) is not None:
-        cp = subprocess.run(["git", "-c", "core.quotepath=off", "ls-files", "-z", "--cached", "--others",
-                             "--exclude-standard", "--", "."], cwd=root, capture_output=True, encoding="utf-8",
+        cp = subprocess.run(project_argv(root, ["git", "-c", "core.quotepath=off", "ls-files", "-z", "--cached",
+                                                "--others", "--exclude-standard", "--", "."]),
+                            cwd=root, capture_output=True, encoding="utf-8",
                             errors="replace", env=sanitize_subprocess_env(os.environ, warn=False))
         rels = [p for p in cp.stdout.split("\0") if p] if cp.returncode == 0 else []
     if not rels:

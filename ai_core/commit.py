@@ -15,6 +15,7 @@ from ai_core import ExitCode
 from ai_core.config import Config
 from ai_core.router import OllamaError, TaskOptions, _ask, _exec_options, emit, interactive, ollama_chat, say
 from ai_core.security import SecretFinding, is_secret_file, sanitize_subprocess_env, scan_secrets
+from ai_core.wsl import project_argv
 
 TYPES = ("feat", "fix", "refactor", "perf", "docs", "test", "build", "ci", "chore", "style", "revert")
 COMMIT_SCHEMA = {
@@ -38,7 +39,8 @@ class CommitError(RuntimeError):
 
 
 def _git(root: Path, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", "-c", "core.quotepath=off", *args], cwd=root, input=stdin, capture_output=True,
+    return subprocess.run(project_argv(root, ["git", "-c", "core.quotepath=off", *args]), cwd=root, input=stdin,
+                          capture_output=True,
                           encoding="utf-8", errors="replace", env=sanitize_subprocess_env(os.environ, warn=False))
 
 

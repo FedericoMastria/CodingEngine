@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from ai_core import TaskStatus
@@ -24,8 +25,9 @@ from ai_core.adapters.base import (
     CHANNEL_QUOTA_RE, NEEDS_CLARIFICATION_RE, AdapterError, AdapterResult, BaseAdapter, TaskRequest,
     refuse_slash_command, stream_process,
 )
-from ai_core.config import Config
+from ai_core.config import HOME, Config
 from ai_core.security import require_cloud_allowed, sanitize_subprocess_env
+from ai_core.wsl import wsl_target
 
 MIN_VERSION = (1, 1, 8)
 REQUIRED_FLAGS = ("--print", "--output-format", "--model", "--mode", "--conversation", "--print-timeout")
@@ -39,6 +41,9 @@ _PROBE_TIMEOUT_S = 60
 _STDERR_TAIL = 2000
 _TIMEOUT_GRACE_S = 30  # our watchdog fires after agy's own --print-timeout
 _MAX_CMDLINE = 32_000  # CreateProcess limit is 32,767 chars for the whole command line
+# agy asks for a login when its cwd is a \\wsl.localhost path (probed 2026-10-26: same command, same env, a Windows cwd
+# answers). For WSL projects it starts here, with the project added to its workspace (--add-dir edits fine).
+WSL_CWD = HOME / ".ai_agy_cwd"
 
 
 def bucket_for_model(model: str) -> str:
@@ -160,11 +165,17 @@ class AntigravityAdapter(BaseAdapter):
         if request.resume_session_id:
             cmd += ["--conversation", request.resume_session_id]
         # No --append-system-prompt equivalent: static part, then dynamic context, then the prompt.
-        for parts in ((HEADLESS_NOTE, request.system_append, request.context_block, request.prompt),
-                      (HEADLESS_NOTE, request.system_append, request.prompt)):
+        root = request.project_root
+        note = ""
+        if wsl_target(root):
+            cmd += ["--add-dir", str(root)]
+            note = (f"The project root is {root}. Resolve every relative path in this task against it (it is not "
+                    "the current directory) and edit files only inside it.")
+        for dropped, parts in ((False, (HEADLESS_NOTE, note, request.system_append, request.context_block, request.prompt)),
+                               (True, (HEADLESS_NOTE, note, request.system_append, request.prompt))):
             full = [*cmd, "--print=" + "\n\n".join(p for p in parts if p)]
             if len(subprocess.list2cmdline(full)) <= _MAX_CMDLINE:
-                if len(parts) == 3 and request.context_block:
+                if dropped and request.context_block:
                     print("⚠ agy: repo-map/project memory dropped to fit the Windows command-line limit",
                           file=sys.stderr)
                 return full
@@ -181,8 +192,12 @@ class AntigravityAdapter(BaseAdapter):
             if event is not None and request.verbose:
                 _echo_event(event)
 
+        cwd = request.project_root
+        if wsl_target(cwd):
+            WSL_CWD.mkdir(parents=True, exist_ok=True)
+            cwd = WSL_CWD
         code, stderr, timed_out = stream_process(
-            self.build_command(request), request.project_root, "",  # stdin is ignored by agy -p
+            self.build_command(request), cwd, "",  # stdin is ignored by agy -p
             sanitize_subprocess_env(os.environ, cloud=True), self.cfg.cloud_timeout_s + _TIMEOUT_GRACE_S, on_line)
         return state.to_result(code, stderr, timed_out)
 

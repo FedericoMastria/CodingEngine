@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from ai_core.config import CONTEXT_DIR_NAME, Config
+from ai_core.wsl import wsl_target
 
 # ---------------------------------------------------------------- Invariant #5: zero API billing
 
@@ -175,8 +176,9 @@ class SecretPathError(PathValidationError):
 
 
 def path_key(path: str | os.PathLike[str]) -> str:
-    """Canonical comparison key: normalized separators, lower-case on Windows (normcase)."""
-    return os.path.normcase(os.path.normpath(os.fspath(path)))
+    """Canonical comparison key: normalized separators, lower-case on Windows (normcase), exact in a WSL project."""
+    norm = os.path.normpath(os.fspath(path))
+    return norm if wsl_target(norm) else os.path.normcase(norm)
 
 
 def is_secret_file(path: str | os.PathLike[str], cfg: Config) -> bool:

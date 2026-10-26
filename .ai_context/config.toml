@@ -48,8 +48,8 @@ verify_l3_timeout_s = 300
 worker_timeout_s = 15
 local_timeout_s = 600
 verify_l2_command = []                     # e.g. ["pyright"]; empty = L2 skipped
-# This repo's own tests run on uv's CPython 3.12 (no system Python on this machine).
-verify_l3_command = ["uv", "run", "--no-project", "--quiet", "--python", ">=3.12", "python", "-m", "unittest"]
+# This repo's own tests run on uv's CPython 3.14 (no system Python on this machine).
+verify_l3_command = ["uv", "run", "--no-project", "--quiet", "--python", ">=3.14", "python", "-m", "unittest"]
 
 # --- Security, secrets, checkpoints (S01-S05, R03) ------------------------------
 secret_scanner_enabled = true

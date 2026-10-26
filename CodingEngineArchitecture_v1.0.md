@@ -352,10 +352,13 @@ Summary of critical architectural hardening resolved between v0.8 and the v0.9 b
 - **Channel Adapters:** Channel A (Claude Code) and Channel B (Antigravity) with real rate-limit windows.
 - **Developer Features:** Multi-turn REPL `ai >`, session continuation `ai -c`, ADR lifecycle, same-volume NTFS Vault, `--review` (local/cross/ponytail), `--commit`, `ait` / `--fix`, `--recover`, and `--gc`.
 - **Terminal UX:** Quiet background routing, ANSI markdown rendering, and structured summary cards.
-- **Test Suite:** 170+ passing unit and integration tests.
+- **WSL Mode:** projects under `\\wsl.localhost\<distro>` are detected automatically; git, verification (L2/L3 with the project `.venv`; L1 stays in-process), `ait` and the vault (distro home, `chmod 700`) run inside the distro through `ai_core/wsl.py`; case-sensitive path identity. **Cloud edits:** Channel A runs the distro's own `claude` (`wsl.exe -d <distro> --cd <dir> -e env -u <API keys> <claude> ...`, resolved with a login shell) because Claude Code refuses every Edit on a UNC working directory; Channel B runs the Windows `agy` started from `~/.ai_agy_cwd` with the project added through `--add-dir`, because agy asks for a login when its cwd is a UNC path. Verified on throwaway repos: local task + undo on a clone of a real FastAPI project (`completed_verified (L3)`), Claude/haiku inside Ubuntu ($0.0033) and agy/gemini-flash with a `.env` isolated by the vault and restored byte-identical (both `completed_verified (L3)`, undo identical).
+- **Engine runtime:** CPython 3.14.
+- **Test Suite:** 223 passing unit and integration tests (WSL live tests skip without the Ubuntu distro).
 
 ### C. Open Verifications and Forward Roadmap
 
 - [ ] **First Statusline Hook Capture in Clean Session:** Confirm first live event capture of `~/.ai_usage/claude.json` following CLI daemon restart.
 - [ ] **Real Task Smoke Test with `--strict-mcp-config`:** Validate `--strict-mcp-config` during an end-to-end task containing an isolated secret file.
+- [ ] **Cloud CLIs on a UNC working directory:** both fail there (Claude Code: every Edit denied, even with `--add-dir`, forward slashes, a `\\wsl$` cwd or a blanket `--allowedTools Edit`; agy: "Authentication required" with the same command and environment that work from a Windows folder). The engine works around it (Claude inside the distro, agy from a Windows folder + `--add-dir`); a release of either CLI that accepts UNC would let both go back to a plain cwd.
 - [ ] **Background Refresh Worker Daemon:** Optional background task refreshing quota states asynchronously when data age exceeds `usage_max_age_min`.

@@ -43,7 +43,7 @@ from ai_core.patcher import OutsideTargetError, PatchError, apply_blocks, parse_
 from ai_core.repomap import build_repo_map
 from ai_core.security import (
     OfflineViolationError, PathValidationError, SecretPathError, detected_billing_vars, enforce_offline,
-    is_offline, redact_secrets, require_cloud_allowed, require_loopback_url, scan_secrets, validate_target_files,
+    is_offline, path_key, redact_secrets, require_cloud_allowed, require_loopback_url, scan_secrets, validate_target_files,
 )
 from ai_core.session import (
     ProjectBusyError, ProjectLock, SessionError, blackboard_context, find_session, load_blackboard, record_turn, record_recent_task,
@@ -52,6 +52,7 @@ from ai_core.session import (
 from ai_core import ollama_env
 from ai_core.vault import NTFSVault, VaultError, find_secret_files, recover
 from ai_core.verification import VerificationResult, compute_baseline, verify
+from ai_core.wsl import WslError, linux_claude, project_key, wsl_target
 
 TASK_TYPES = ("algorithmic", "architecture", "debug", "refactor", "boilerplate", "docs")
 ROUTING_SCHEMA: dict[str, Any] = {
@@ -469,7 +470,7 @@ def validate_routing(data: Any, root: Path, cfg: Config, user_targets: list[Path
                                              confirm_new_dir=confirm_new_dir)
         except PathValidationError:
             continue  # hallucinated / unsafe path: dropped, the cloud gets no forced path for it
-    unique = list({os.path.normcase(str(p)): p for p in targets}.values())
+    unique = list({path_key(p): p for p in targets}.values())
     return Routing(data["files_scope"], data["reasoning_depth"], data["needs_repo_search"],
                    data["creates_new_files"], data["task_type"], unique,
                    notes[:2000] if isinstance(notes, str) and notes.strip() else None, "ollama")
@@ -539,10 +540,27 @@ def agy_model_for_depth(cfg: Config, depth: int, *, claude_family: bool) -> str:
         depth, cfg.agy_model_argon_high)
 
 
-def compute_channels(cfg: Config, credit: CreditManager | None) -> Channels:
+_warned: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key not in _warned:  # compute_channels runs again at every channel rotation
+        _warned.add(key)
+        print(f"⚠ {message}", file=sys.stderr)
+
+
+def compute_channels(cfg: Config, credit: CreditManager | None, root: Path | None = None) -> Channels:
     if is_offline():
         return Channels("unavailable", frozenset())
-    has_claude = shutil.which("claude") or (HOME / ".local" / "bin" / "claude.exe").exists()
+    target = wsl_target(root) if root else None
+    if target:  # WSL project: Claude runs as the distro's own install (a UNC cwd blocks its edits); agy is unverified
+        try:
+            has_claude = linux_claude(target.distro)
+        except WslError as exc:
+            _warn_once("claude-" + target.distro, str(exc))
+            has_claude = None
+    else:
+        has_claude = shutil.which("claude") or (HOME / ".local" / "bin" / "claude.exe").exists()
     a_state = "unavailable"
     if has_claude and not cfg.claude_allow_usage_credits:
         try:
@@ -1028,7 +1046,14 @@ def run_cloud(opts: TaskOptions, cfg: Config, ctx: TaskContext, decision: Decisi
     root = opts.project_root
     routing = ctx.routing
     out = Outcome(TaskStatus.PROVIDER_ERROR, decision.channel, decision.model)
-    notes = [f"target_files: {', '.join(_rel(p, root) for p in routing.target_files)}"] if routing.target_files else []
+    if target := wsl_target(root):  # also stops --channel, which skips the channel matrix
+        if decision.channel == "claude":
+            try:
+                linux_claude(target.distro)
+            except WslError as exc:
+                out.message = str(exc)
+                return out
+    notes = [f"target_files:{', '.join(_rel(p, root) for p in routing.target_files)}"] if routing.target_files else []
     if routing.routing_notes:
         notes.append(routing.routing_notes)
     context = "\n".join(s for s in (
@@ -1274,7 +1299,7 @@ def _dispatch_loop(opts: TaskOptions, cfg: Config, ctx: TaskContext, decision: D
                 except PathValidationError:
                     continue  # hallucinated, secret or outside the project: never forwarded
                 for p in found:
-                    discovered.add(_rel(p, base).lower())
+                    discovered.add(project_key(base, _rel(p, base)))
                     if p not in ctx.routing.target_files:
                         ctx.routing.target_files.append(p)
                         ctx.contents[p] = _read_text(p)
@@ -1286,7 +1311,7 @@ def _dispatch_loop(opts: TaskOptions, cfg: Config, ctx: TaskContext, decision: D
             out = run_cloud(opts, cfg, ctx, decision, task_id, credit=credit, **cloud_kwargs)
             score = attempt_score(out)
             finished = out.status in _SCORE_OK or out.status == TaskStatus.COMPLETED_UNVERIFIED
-            missing = sorted(discovered - {t.lower() for t in out.touched}) if finished else []
+            missing = sorted(discovered - {project_key(base, t) for t in out.touched}) if finished else []
             if missing:  # verified, yet files the change needs were left alone (e.g. compat shims instead)
                 score = 0
                 out.message = (f"incomplete: {', '.join(missing)} not changed, although the task needs it"
@@ -1301,7 +1326,7 @@ def _dispatch_loop(opts: TaskOptions, cfg: Config, ctx: TaskContext, decision: D
                 failed_model = decision.model
                 _raise_depth(ctx)
                 _add_context(cloud_kwargs, "previous_cloud_attempt_failed", f"{failed_model}: {out.message}")
-                decision = decide(cfg, ctx.routing, ctx.tokens, False, compute_channels(cfg, credit),
+                decision = decide(cfg, ctx.routing, ctx.tokens, False, compute_channels(cfg, credit, opts.project_root),
                                   exclude=frozenset(tried), allow_local=False)
                 if decision.channel == "none":
                     return out
@@ -1315,7 +1340,7 @@ def _dispatch_loop(opts: TaskOptions, cfg: Config, ctx: TaskContext, decision: D
                 return out
             print(f"↻ {decision.channel} unavailable ({out.message}); rotating channel", file=sys.stderr)
             tried.add(decision.channel)
-        channels = compute_channels(cfg, credit)
+        channels = compute_channels(cfg, credit, opts.project_root)
         decision = decide(cfg, ctx.routing, ctx.tokens, False, channels, exclude=frozenset(tried),
                           allow_local="local" not in tried)
         if decision.channel == "none":
@@ -1425,8 +1450,8 @@ def _run(opts: TaskOptions, cfg: Config) -> ExitCode:
         if isinstance(pending, dict):
             for sid, sess in pending.items():
                 if isinstance(sess, dict) and sess.get("status") == TaskStatus.NEEDS_CLARIFICATION:
-                    sess_targets = {p.replace("\\", "/").lower() for p in sess.get("target_files", [])}
-                    curr_targets = {_rel(p, root).replace("\\", "/").lower() for p in targets}
+                    sess_targets = {project_key(root, p) for p in sess.get("target_files", [])}
+                    curr_targets = {project_key(root, _rel(p, root)) for p in targets}
                     if overlap := sess_targets & curr_targets:
                         print(f"⚠ warning: task touches file(s) from suspended session '{sid}' "
                               f"(in needs_clarification): {', '.join(sorted(overlap))}. "
@@ -1459,7 +1484,7 @@ def _run(opts: TaskOptions, cfg: Config) -> ExitCode:
 
     # Phase 3 - decision
     credit = None if is_offline() else CreditManager(cfg)
-    decision = decide(cfg, ctx.routing, ctx.tokens, is_offline(), compute_channels(cfg, credit), forced_channel=opts.channel,
+    decision = decide(cfg, ctx.routing, ctx.tokens, is_offline(), compute_channels(cfg, credit, opts.project_root), forced_channel=opts.channel,
                       stats=blackboard.get("routing_stats") if cfg.adaptive_routing else None)
     if opts.dry_run:
         return _dry_run_report(opts, cfg, ctx, decision)
@@ -1557,7 +1582,7 @@ def _continue(opts: TaskOptions, cfg: Config, ollama: OllamaStatus) -> ExitCode:
                       _repo_map(root, cfg, targets, working_set), 0)
     ctx.tokens = _context_tokens(ctx, opts.prompt)
     credit = None if is_offline() else CreditManager(cfg)
-    channels = compute_channels(cfg, credit)
+    channels = compute_channels(cfg, credit, opts.project_root)
     channel, model, sid = s.get("channel", ""), s.get("model", ""), s.get("session_or_conversation_id")
     question = s.get("pending_question") or ""
     history = (f"<previous_turn>\n<original_task>\n{s.get('prompt', '')}\n</original_task>\n"
@@ -1711,6 +1736,7 @@ def show_status(root: Path, cfg: Config, as_json: bool = False) -> ExitCode:
     st = ollama_status(cfg)
     info: dict[str, Any] = {
         "project": str(root),
+        **({"wsl": f"{target.distro}:{target.linux_path}"} if (target := wsl_target(root)) else {}),
         "billing_env_vars": detected_billing_vars(os.environ),
         "ollama": {"reachable": st.reachable, "model": cfg.ollama_model, "installed": st.model_present,
                    "gpu": {True: "100% GPU", False: "local_degraded", None: "not loaded"}[st.gpu_full],

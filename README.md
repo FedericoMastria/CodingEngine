@@ -1,6 +1,6 @@
 # CodingEngine
 
-[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.14](https://img.shields.io/badge/python-3.14-blue.svg)](https://www.python.org/downloads/)
 [![Platform: Windows 11](https://img.shields.io/badge/platform-Windows%2011-0078D6.svg)](https://www.microsoft.com/windows)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Local First](https://img.shields.io/badge/architecture-local--first-success.svg)]()
@@ -137,7 +137,7 @@ ai --undo --task-id 20261026-114500-a1b2
 ### Prerequisites
 
 - **OS:** Windows 11 (64-bit)
-- **Runtime:** Python 3.12+
+- **Runtime:** Python 3.14+
 - **Local LLM Server:** [Ollama](https://ollama.com/) with `qwen3.6:35b-a3b` (or configured dense alternative `qwen3.8:27b`)
 - **Cloud CLIs (Optional for Cloud Dispatch):**
   - Claude Code CLI (`claude.exe`)

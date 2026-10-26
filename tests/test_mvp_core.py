@@ -24,7 +24,7 @@ from ai_core.adapters.base import AdapterError, TaskRequest
 from ai_core.adapters.claude_adapter import ClaudeAdapter, StreamState
 from ai_core.checkpoint import (
     REF_PREFIX, CheckpointError, create_checkpoint, file_sha256, finalize_checkpoint, gc_checkpoints,
-    list_checkpoints, safe_undo,
+    git_refusal, list_checkpoints, safe_undo,
 )
 from ai_core.config import Config, ConfigError, load_config, validate_config
 from ai_core.patcher import EditBlock, PatchError, apply_blocks, parse_blocks
@@ -375,6 +375,24 @@ class TestCheckpoint(TempWorkspace):
         with self.assertRaises(CheckpointError):
             create_checkpoint(self.ws, CFG, [])
         self.assertEqual(git(self.ws, "for-each-ref", REF_PREFIX), "")
+
+
+class TestGitRefusal(TempWorkspace):
+    """WSL repos opened from Windows: Git refuses them ('dubious ownership'), never degrade silently to non-Git."""
+
+    def test_refused_repo_stops_every_command(self) -> None:
+        import ai_router
+        self.init_git()
+        self.assertIsNone(git_refusal(self.ws))
+        with mock.patch.dict(os.environ, {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}):
+            self.assertIn("safe.directory", git_refusal(self.ws))
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(ai_router.main(["--dir", str(self.ws), "--undo"]), ExitCode.FAILED)
+        self.assertIn("dubious ownership", err.getvalue())
+
+    def test_plain_folder_is_not_a_refusal(self) -> None:
+        self.assertIsNone(git_refusal(self.ws))
 
 
 class TestCheckpointNonGit(TempWorkspace):

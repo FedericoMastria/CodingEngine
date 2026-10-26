@@ -24,6 +24,7 @@ from pathlib import Path, PurePosixPath
 from ai_core import config as cfgmod
 from ai_core.config import Config
 from ai_core.security import is_secret_file, is_within, path_key, sanitize_subprocess_env
+from ai_core.wsl import project_argv, to_windows, wsl_target
 
 MANIFEST = "manifest.json"
 REF_PREFIX = "refs/ai/checkpoints/"
@@ -116,7 +117,7 @@ def _now() -> str:
 
 def _git(base: Path, *args: str, check: bool = True, binary: bool = False) -> subprocess.CompletedProcess:
     cp = subprocess.run(
-        ["git", "-c", "core.quotepath=off", *args], cwd=base, capture_output=True,
+        project_argv(base, ["git", "-c", "core.quotepath=off", *args]), cwd=base, capture_output=True,
         env=sanitize_subprocess_env(os.environ, warn=False),
         **({} if binary else {"encoding": "utf-8", "errors": "replace"}),
     )
@@ -135,12 +136,30 @@ def git_toplevel(project_root: Path) -> Path | None:
         cp = _git(project_root, "rev-parse", "--show-toplevel", check=False)
     except FileNotFoundError:  # git not installed
         return None
-    return Path(os.path.normpath(cp.stdout.strip())) if cp.returncode == 0 else None
+    return _windows_path(project_root, cp.stdout.strip()) if cp.returncode == 0 else None
+
+
+def _windows_path(project_root: Path, printed: str) -> Path:
+    """A path git printed: inside the distro it is a Linux path, which Windows code cannot open."""
+    target = wsl_target(project_root)
+    return to_windows(target, printed) if target and printed.startswith("/") else Path(os.path.normpath(printed))
+
+
+def git_refusal(project_root: Path) -> str | None:
+    """Git's 'dubious ownership' error (WSL repo seen from Windows), else None.
+
+    git_toplevel() reads it as "not a repo", so checkpoints would silently lose HEAD/index state.
+    """
+    try:
+        cp = _git(project_root, "rev-parse", "--show-toplevel", check=False)
+    except FileNotFoundError:
+        return None
+    return cp.stderr.strip() if cp.returncode != 0 and "dubious ownership" in cp.stderr else None
 
 
 def git_operation_in_progress(base: Path) -> str | None:
     """R02: a merge/rebase/cherry-pick leaves conflicts in the index; never checkpoint over it."""
-    git_dir = Path(_git(base, "rev-parse", "--absolute-git-dir").stdout.strip())
+    git_dir = _windows_path(base, _git(base, "rev-parse", "--absolute-git-dir").stdout.strip())
     return next((op for op in _GIT_OPS_IN_PROGRESS if (git_dir / op).exists()), None)
 
 
@@ -149,12 +168,24 @@ def _head_sha(base: Path) -> str | None:
     return cp.stdout.strip() or None
 
 
+def _keep_mode(tmp: Path, path: Path) -> None:
+    """Through the 9P share a rename over `path` leaves `tmp`'s mode (644): scripts lose +x, 600 files open up."""
+    if not (wsl_target(path) and path.exists()):
+        return
+    cp = subprocess.run(project_argv(path.parent, ["chmod", "--reference", str(path), str(tmp)]), cwd=path.parent,
+                        capture_output=True, encoding="utf-8", errors="replace",
+                        env=sanitize_subprocess_env(os.environ, warn=False))
+    if cp.returncode != 0:
+        raise OSError(f"cannot preserve the mode of {path}: {(cp.stderr or cp.stdout).strip()}")
+
+
 def write_bytes_atomic(path: Path, data: bytes) -> None:
     """Temp sibling + os.replace: readers never observe a half-written file (Invariant #2)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.ai_tmp_{secrets.token_hex(4)}")
     try:
         tmp.write_bytes(data)
+        _keep_mode(tmp, path)
         retry_win_lock(os.replace, tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
@@ -170,6 +201,7 @@ def _copy_atomic(src: Path, dst: Path) -> None:
     tmp = dst.with_name(f"{dst.name}.ai_tmp_{secrets.token_hex(4)}")
     try:
         retry_win_lock(shutil.copy2, src, tmp)
+        _keep_mode(tmp, dst)
         retry_win_lock(os.replace, tmp, dst)
     finally:
         tmp.unlink(missing_ok=True)

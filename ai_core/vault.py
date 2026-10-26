@@ -24,7 +24,8 @@ from types import TracebackType
 
 from ai_core.checkpoint import retry_win_lock, write_json_atomic
 from ai_core.config import CONTEXT_DIR_NAME, Config
-from ai_core.security import is_secret_file
+from ai_core.security import is_secret_file, sanitize_subprocess_env
+from ai_core.wsl import WslError, linux_home, project_argv, to_windows, wsl_target
 
 VAULT_PARENT: Path | None = None  # None = root of the project's volume; tests point it elsewhere
 JOURNAL = "journal.json"
@@ -51,7 +52,21 @@ def user_sid() -> str:
 
 
 def vault_root(project_root: Path) -> Path:
+    if VAULT_PARENT is None and (target := wsl_target(project_root.resolve())):
+        # the anchor of a UNC path is the distro's `/`, unwritable: use the Linux user's home instead
+        return to_windows(target, f"{linux_home(target.distro)}/.ai_vault_{user_sid()}")
     return (VAULT_PARENT or Path(project_root.resolve().anchor)) / f".ai_vault_{user_sid()}"
+
+
+def _device(path: Path) -> object:
+    """Filesystem id. A UNC share reports st_dev 0 for everything, so inside the distro ask `stat`."""
+    if not wsl_target(path):
+        return os.stat(path).st_dev
+    cp = subprocess.run(project_argv(path, ["stat", "-c", "%d", str(path)]), cwd=path, capture_output=True,
+                        encoding="utf-8", errors="replace", env=sanitize_subprocess_env(os.environ, warn=False))
+    if cp.returncode != 0:
+        raise VaultError(f"cannot stat {path}: {(cp.stderr or cp.stdout).strip()}")
+    return cp.stdout.strip()
 
 
 def find_secret_files(root: Path, cfg: Config) -> list[Path]:
@@ -66,6 +81,12 @@ def find_secret_files(root: Path, cfg: Config) -> list[Path]:
 
 def _restrict_acl(path: Path) -> None:
     """Owner-only ACL. Without it a folder under C:\\ would inherit 'Authenticated Users: Modify'."""
+    if wsl_target(path):  # a Linux filesystem: mode bits, not ACLs
+        cp = subprocess.run(project_argv(path, ["chmod", "700", str(path)]), cwd=path, capture_output=True,
+                            encoding="utf-8", errors="replace", env=sanitize_subprocess_env(os.environ, warn=False))
+        if cp.returncode != 0:
+            raise VaultError(f"cannot chmod 700 {path}: {(cp.stderr or cp.stdout).strip()}")
+        return
     if sys.platform != "win32":
         os.chmod(path, 0o700)
         return
@@ -131,13 +152,13 @@ class NTFSVault:
     def __enter__(self) -> NTFSVault:
         if not self.files:
             return self
-        root = vault_root(self.project_root)
         try:
+            root = vault_root(self.project_root)
             root.mkdir(exist_ok=True)
             _restrict_acl(root)
-        except OSError as exc:  # WinError 5 at the drive root, read-only volume, ...
-            raise VaultError(f"cannot create vault {root}: {exc}") from exc
-        if os.stat(root).st_dev != os.stat(self.project_root).st_dev:
+        except (OSError, WslError) as exc:  # WinError 5 at the drive root, read-only volume, wsl.exe gone, ...
+            raise VaultError(f"cannot create vault: {exc}") from exc
+        if _device(root) != _device(self.project_root):
             raise VaultError(f"vault {root} is not on the project's volume: refusing cross-volume moves")
         self.session_dir = root / secrets.token_urlsafe(16)  # unpredictable name
         self.session_dir.mkdir()
@@ -176,7 +197,10 @@ class NTFSVault:
 
 def recover(project_root: Path) -> list[str]:
     """Restore anything left in the vault of this volume (crash, power loss, killed process)."""
-    root = vault_root(project_root)
+    try:
+        root = vault_root(project_root)
+    except WslError as exc:
+        return [f"⚠ cannot check the vault: {exc}"]
     if not root.is_dir():
         return []
     messages: list[str] = []

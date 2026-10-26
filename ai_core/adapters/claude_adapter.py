@@ -6,7 +6,9 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from ai_core import TaskStatus
@@ -15,7 +17,8 @@ from ai_core.adapters.base import (
     refuse_slash_command, stream_process,
 )
 from ai_core.config import HOME, Config
-from ai_core.security import require_cloud_allowed, sanitize_subprocess_env
+from ai_core.security import API_KEY_VARS, require_cloud_allowed, sanitize_subprocess_env
+from ai_core.wsl import WslError, linux_claude, project_argv, wsl_target
 
 # Flags this adapter relies on; checked against `claude --help` before the first dispatch.
 REQUIRED_FLAGS = (
@@ -117,11 +120,28 @@ class ClaudeAdapter(BaseAdapter):
         self.cfg = cfg
         self.binary = binary or shutil.which("claude") or str(HOME / ".local" / "bin" / "claude.exe")
         self.version: str | None = None
+        self._wsl_versions: dict[str, str] = {}  # per distro: the Linux claude is a separate install
 
-    def _run_quick(self, *args: str) -> str:
+    def _launch(self, root: Path | None, args: Sequence[str]) -> list[str]:
+        """The claude command line: the Windows binary, or the distro's own for a WSL project.
+
+        Claude Code refuses every Edit on a UNC cwd (probed 2026-10-26), so a WSL project runs it inside the distro.
+        `env -u` removes the API keys on the Linux side too (Invariant #5), whatever the distro's environment holds.
+        """
+        target = wsl_target(root) if root else None
+        if target is None:
+            return [self.binary, *args]
+        strip = [arg for var in sorted(API_KEY_VARS) for arg in ("-u", var)]
+        try:
+            return project_argv(root, ["env", *strip, linux_claude(target.distro), *args])
+        except WslError as exc:
+            raise AdapterError(str(exc)) from exc
+
+    def _run_quick(self, *args: str, root: Path | None = None) -> str:
+        argv = self._launch(root, args)
         try:
             cp = subprocess.run(
-                [self.binary, *args], capture_output=True, encoding="utf-8", errors="replace",
+                argv, capture_output=True, encoding="utf-8", errors="replace",
                 timeout=_PROBE_TIMEOUT_S, env=sanitize_subprocess_env(os.environ, warn=False, cloud=True),
                 stdin=subprocess.DEVNULL,
             )
@@ -135,14 +155,21 @@ class ClaudeAdapter(BaseAdapter):
             raise AdapterError(f"claude {' '.join(args)} exited {cp.returncode}: {cp.stderr.strip()}")
         return cp.stdout
 
-    def probe(self) -> str:
-        """`claude --version` + `--help` capability check (B02/B03): refuse unverified CLIs."""
+    def _verify(self, root: Path | None) -> str:
+        version = self._run_quick("--version", root=root).strip()
+        help_text = self._run_quick("--help", root=root)
+        if missing := [f for f in REQUIRED_FLAGS if f not in help_text]:
+            raise AdapterError(f"claude {version} lacks required flags: {', '.join(missing)}")
+        return version
+
+    def probe(self, root: Path | None = None) -> str:
+        """`claude --version` + `--help` capability check (B02/B03): refuse unverified CLIs (per install)."""
+        if target := wsl_target(root) if root else None:
+            if target.distro not in self._wsl_versions:
+                self._wsl_versions[target.distro] = self._verify(root)
+            return self._wsl_versions[target.distro]
         if self.version is None:
-            version = self._run_quick("--version").strip()
-            help_text = self._run_quick("--help")
-            if missing := [f for f in REQUIRED_FLAGS if f not in help_text]:
-                raise AdapterError(f"claude {version} lacks required flags: {', '.join(missing)}")
-            self.version = version
+            self.version = self._verify(None)
         return self.version
 
     def disallowed_tools(self) -> list[str]:
@@ -176,10 +203,14 @@ class ClaudeAdapter(BaseAdapter):
             cmd.append("--exclude-dynamic-system-prompt-sections")
         return cmd
 
+    def _launch_task(self, request: TaskRequest) -> list[str]:
+        cmd = self.build_command(request)
+        return self._launch(request.project_root, cmd[1:]) if wsl_target(request.project_root) else cmd
+
     def run_task(self, request: TaskRequest) -> AdapterResult:
         require_cloud_allowed(self.name)  # re-checked at dispatch time: the latch may have closed
         refuse_slash_command(request.prompt, "claude")
-        self.probe()
+        self.probe(request.project_root)
         payload = f"{request.context_block}\n\n{request.prompt}" if request.context_block else request.prompt
         state = StreamState()
 
@@ -190,7 +221,7 @@ class ClaudeAdapter(BaseAdapter):
 
         try:
             code, stderr, timed_out = stream_process(
-                self.build_command(request), request.project_root, payload,
+                self._launch_task(request), request.project_root, payload,
                 sanitize_subprocess_env(os.environ, cloud=True), self.cfg.cloud_timeout_s, on_line)
         except AdapterError as exc:
             raise AdapterError(f"{exc} (binary: {self.binary})") from exc
