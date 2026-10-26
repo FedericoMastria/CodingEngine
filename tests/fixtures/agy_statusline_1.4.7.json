@@ -1,0 +1,51 @@
+{
+  "model": {
+    "id": "Gemini 3.8 Flash (High)",
+    "display_name": "Gemini 3.8 Flash (High)",
+    "effort": "high"
+  },
+  "version": "1.4.7",
+  "context_window": {
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "context_window_size": 1048576,
+    "used_percentage": 0,
+    "remaining_percentage": 100,
+    "current_usage": null
+  },
+  "exceeds_200k_tokens": null,
+  "product": "antigravity",
+  "quota": {
+    "3p-5h": {
+      "remaining_fraction": 1,
+      "reset_time": "2026-10-26T01:13:20Z",
+      "reset_in_seconds": 17999
+    },
+    "3p-weekly": {
+      "remaining_fraction": 0.437318,
+      "reset_time": "2026-10-31T09:42:32Z",
+      "reset_in_seconds": 480551
+    },
+    "gemini-5h": {
+      "remaining_fraction": 0.90389675,
+      "reset_time": "2026-10-25T22:29:34Z",
+      "reset_in_seconds": 8173
+    },
+    "gemini-argon-wtu-weekly": {
+      "remaining_fraction": 0.025530534,
+      "reset_time": "2026-10-27T20:10:43Z",
+      "reset_in_seconds": 172642
+    },
+    "gemini-weekly": {
+      "remaining_fraction": 0.8926468,
+      "reset_time": "2026-10-26T11:02:03Z",
+      "reset_in_seconds": 53322
+    }
+  },
+  "agent_state": "idle",
+  "sandbox": {
+    "enabled": false
+  },
+  "plan_tier": "Google AI Pro",
+  "terminal_width": 160
+}

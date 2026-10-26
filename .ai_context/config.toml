@@ -1,0 +1,69 @@
+# CodingEngine project configuration (spec v3.0 §11).
+# Timeouts and pre-fill thresholds are initial values to calibrate with the §12.3 benchmark.
+# Unknown keys are rejected at load time (typo protection).
+
+# --- Ollama & context (L01-L05) -------------------------------------------------
+ollama_url = "http://127.0.0.1:11434"
+ollama_model = "qwen3.6:35b-a3b"          # verified with `ollama list` (B05)
+ollama_num_ctx = 32768                     # identical for ai, Jarvis and the ADR worker (L02)
+local_max_input_tokens = 26000
+local_max_files = 3
+scoring_full_content_max_tokens = 5500     # §12.3 benchmark 2026-10-25: ~8 s of prefill
+ollama_num_predict_standard = 4096
+ollama_num_predict_thinking = 6144
+calibrated_prefill_tps = 260.0             # §12.3: slowest measured prefill (325 tok/s @21k) x 0.8
+
+# --- Channel A: Claude Pro (B01, Q02) -------------------------------------------
+claude_monthly_credit_usd = 20.0
+claude_credit_cycle_day = 1
+claude_credit_reserve_pct = 15
+claude_allow_usage_credits = false         # FIXED: true makes the orchestrator refuse Channel A
+claude_use_advisor_on_depth_3 = false
+claude_model_haiku = "haiku"               # -> claude-haiku-5-5 (smoke test §12.1)
+claude_model_sonnet = "sonnet"             # -> claude-sonnet-5-5
+claude_model_opus = "opus"                 # -> claude-opus-5-5 (always asks for confirmation)
+claude_max_budget_usd_per_task = 1.0       # passed as --max-budget-usd on every call
+cloud_timeout_s = 1800
+
+# --- Channel B: Antigravity / Gemini Pro (B04, B05) - Phase 2 -------------------
+# Fill from the real `agy` output of smoke test §12.1 step 2/4.
+agy_model_flash = "gemini-3.8-flash-high"
+agy_model_argon_low = "gemini-4-argon-low"
+agy_model_argon_med = "gemini-4-argon-medium"
+agy_model_argon_high = "gemini-4-argon-high"
+agy_model_sonnet = "claude-sonnet-5-5-medium"
+agy_model_opus = "claude-opus-5-5-high"
+agy_enable_headless_slash_commands = false
+
+# --- Timeouts (to calibrate in §12.3) -------------------------------------------
+scoring_base_timeout_s = 3
+scoring_max_timeout_s = 25
+# Extra allowance when the model is not resident (`/api/ps` empty). Measured 2026-10-25 on the
+# Dedicated GPU: load_duration 48.7 s + first-call warm-up 19.9 s. Without it the client timeout
+# aborts the load and every run stays cold.
+ollama_cold_load_timeout_s = 120
+verify_l1_timeout_s = 15
+verify_l2_timeout_s = 120
+verify_l3_timeout_s = 300
+worker_timeout_s = 15
+local_timeout_s = 600
+verify_l2_command = []                     # e.g. ["pyright"]; empty = L2 skipped
+# This repo's own tests run on uv's CPython 3.12 (no system Python on this machine).
+verify_l3_command = ["uv", "run", "--no-project", "--quiet", "--python", ">=3.12", "python", "-m", "unittest"]
+
+# --- Security, secrets, checkpoints (S01-S05, R03) ------------------------------
+secret_scanner_enabled = true
+secret_file_patterns = [".env", ".env.*", "*.pem", "*.key", "*.pfx", "*.p12", "id_rsa*", "id_ed25519*",
+                        "credentials.json", "service-account*.json", ".npmrc", ".pypirc", ".netrc", "*.tfvars"]
+safe_template_exceptions = [".env.example", ".env.sample", ".env.template"]
+vault_isolation_mode = "auto"              # "auto" | "never" (vault: Phase 3)
+checkpoint_max_keep = 10
+checkpoint_max_total_mb = 50
+checkpoint_exclude_dirs = ["node_modules", ".venv", "venv", "target", "dist", "build", ".next", ".nuxt",
+                           "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".gradle", "bin",
+                           "obj", "coverage"]
+
+# --- Ponytail & skills (M01, S06) -----------------------------------------------
+ponytail_mode = "full"                     # "off" | "lite" | "full" | "ultra"
+adr_require_approval = true
+rotate_session_on_cooldown = true

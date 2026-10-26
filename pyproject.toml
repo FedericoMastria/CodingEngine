@@ -1,0 +1,22 @@
+# Packaging only to get native `ai.exe` / `ait.exe` launchers (uv tool install --editable .).
+# A real .exe passes argv untouched; the .cmd wrappers are re-parsed by cmd.exe, which turns
+# unquoted > | & (PowerShell strips the quotes) into redirections before Python even starts.
+# Core is standard library only; rich + prompt_toolkit are used just by the interactive REPL.
+[project]
+name = "codingengine"
+version = "1.0.0"
+description = "Local-first multi-CLI AI orchestrator and router for Windows 11"
+requires-python = ">=3.12"
+dependencies = ["rich>=13", "prompt_toolkit>=3"]  # REPL TUI only (ai_core/tui.py); falls back to input() without them
+
+[project.scripts]
+ai = "ai_router:main"
+ait = "ai_router:ait_main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["ai_router"]
+packages = ["ai_core", "ai_core.adapters"]

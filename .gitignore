@@ -1,0 +1,45 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Packaging & build
+*.egg-info/
+dist/
+build/
+
+# CodingEngine runtime state (runtime artifacts and transient state)
+.ai_context/*
+!.ai_context/config.toml
+!.ai_context/.gitignore
+
+# Scratch & superpowers temporary ledgers
+.superpowers/
+
+# Secrets & credentials (fail-safe)
+.env*
+*.pem
+*.key
+*.cert
+
+# OS and IDE files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+*.flag
+
+# Local Italian documentation copies (kept local, excluded from Git)
+*_it.md
+docs/*_it.md
+
+# Internal development plans and design artifacts (kept local, excluded from Git)
+docs/superpowers/
