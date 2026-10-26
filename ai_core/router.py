@@ -79,7 +79,8 @@ SCORING_SYSTEM = (
     "needs_repo_search: true if relevant files are unknown and must be searched for.\n"
     "creates_new_files: true only if the task explicitly asks to create new files.\n"
     "conversational: true if the message is chat, a greeting, or a question to be answered in words (about capabilities, "
-    "concepts, the project, 'can you X?') and asks for NO change to any file; false if it asks to actually edit, create, "
+    "concepts, the project, 'can you X?') or a read-only request to read, analyze, explain, summarize or show what is "
+    "in files, and asks for NO change to any file; false if it asks to actually edit, create, delete, "
     "fix or run something, even politely.\n"
     "target_files: project-relative paths that must be edited or created. If creates_new_files is true, target_files "
     "MUST include the relative path of the new file(s) to create (if a specific filename is not given, infer a sensible filename from the prompt, e.g. 'ciao.txt', 'notes.txt', 'script.py').\n"
@@ -824,6 +825,10 @@ def run_conversational_chat(opts: TaskOptions, cfg: Config, ctx: TaskContext, pr
         ctx.repo_map = _repo_map(root, cfg, [], [])
     if about_project and ctx.repo_map:
         user_content = f"<repo_map>\n{ctx.repo_map}\n</repo_map>\n\n<task>\n{user_prompt}\n</task>"
+    if files := [(p, t) for p, t in ctx.contents.items() if t]:  # "what is written in ciao.txt?": answer from the real text
+        budget = cfg.scoring_full_content_max_tokens * 3  # ~3.7 chars/token measured; never feed an unbounded file
+        blocks = "\n".join(f'<file path="{_rel(p, root)}">\n{t[:budget]}\n</file>' for p, t in files)
+        user_content = f"<files>\n{blocks}\n</files>\n\n{user_content}"
 
     messages: list[dict[str, str]] = [{"role": "system", "content": system}]
     if isinstance(chat_history, list):
@@ -1413,6 +1418,27 @@ def run(opts: TaskOptions, cfg: Config) -> ExitCode:
         return ExitCode.OFFLINE_UNAVAILABLE
 
 
+ANSWER_SCHEMA = {"type": "object", "properties": {"is_answer": {"type": "boolean"}}, "required": ["is_answer"]}
+
+
+def answers_pending_question(cfg: Config, opts: TaskOptions) -> bool:
+    """Does the line reply to the suspended session's question, or is it a new request? Unsure -> True (continue)."""
+    try:
+        bb, _ = load_blackboard(opts.project_root)
+        _, s = find_session(bb, opts.task_id)
+        if not (question := s.get("pending_question")):
+            return True
+        system = ("An agent asked the user a question. Decide if the user's new message is a reply to that question "
+                  "(yes/no, a choice, a filename, a detail) or an unrelated new request or question. "
+                  'Reply JSON only: {"is_answer": true|false}.')
+        user = f"<agent_question>\n{question}\n</agent_question>\n<user_message>\n{opts.prompt}\n</user_message>"
+        content, _ = ollama_chat(cfg, [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                                 think=False, options=SCORING_OPTIONS, timeout=cfg.scoring_base_timeout_s, fmt=ANSWER_SCHEMA)
+        return json.loads(content).get("is_answer") is not False
+    except (OllamaError, SessionError, ValueError, AttributeError):
+        return True
+
+
 def _converse(opts: TaskOptions, cfg: Config, ctx: TaskContext) -> ExitCode:
     """Tier-0 chat answer: no checkpoint, no cloud, no patch."""
     decision = Decision("local", cfg.ollama_model, "conversational / direct Q&A [Tier-0 locale]")
@@ -1472,17 +1498,16 @@ def _run(opts: TaskOptions, cfg: Config) -> ExitCode:
         if opts.verbose:
             print(f"⚠ local_degraded: auto-reduced ollama_num_ctx to {cfg.ollama_num_ctx} (L03)", file=sys.stderr)
     # Conversational / Direct Q&A fast-path (Tier-0 locale, zero cloud costs)
-    chat = not opts.file_args and is_conversational_prompt(opts.prompt)
-    if not chat and opts.continue_session and not opts.file_args and ollama.reachable and ollama.model_present:
-        # the REPL continues the previous session by default: a new question must not be sent to it as an "answer"
-        chat = score_task(cfg, opts.prompt, root, [], {}, estimate_tokens(opts.prompt)).conversational
-    if chat:
+    if not opts.file_args and is_conversational_prompt(opts.prompt):
         blackboard, _ = load_blackboard(root)
         ctx = TaskContext(default_routing([]), {}, load_profile(cfg),
                           blackboard_context(blackboard), "", 0)
         ctx.tokens = estimate_tokens(opts.prompt)
         return _converse(opts, cfg, ctx)
 
+    if opts.continue_session and ollama.reachable and ollama.model_present and not answers_pending_question(cfg, opts):
+        # the REPL continues the last session by default: an unrelated new request must not be sent to it as an "answer"
+        opts = dataclasses.replace(opts, continue_session=False, task_id=None)
     if opts.continue_session:
         return _continue(opts, cfg, ollama)
 
@@ -1532,12 +1557,12 @@ def _run(opts: TaskOptions, cfg: Config) -> ExitCode:
         ctx.routing = score_task(cfg, opts.prompt, root, targets, ctx.contents, ctx.tokens,
                                  cold=ollama.gpu_full is None, repo_map=ctx.repo_map,
                                  confirm_new_dir=new_dir_confirmer(opts, ctx.new_dir_answers))
-    if ctx.routing.conversational and not targets and not opts.extra_directives:
-        return _converse(opts, cfg, ctx)  # a question the keyword fast path missed ("Puoi creare file?")
     if opts.extra_directives and ctx.routing.task_type != "debug":
         ctx.routing.task_type = "debug"  # --fix is debugging by definition
     for p in ctx.routing.target_files:
         ctx.contents.setdefault(p, _read_text(p))
+    if ctx.routing.conversational and not opts.extra_directives:
+        return _converse(opts, cfg, ctx)  # a question the keyword fast path missed ("Puoi creare file?"); sees the named files
     ctx.tokens = _context_tokens(ctx, opts.prompt)
     if opts.offline and ctx.tokens > cfg.local_max_input_tokens:
         if ctx.repo_map and targets:
