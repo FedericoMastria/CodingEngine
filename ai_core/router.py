@@ -1445,7 +1445,11 @@ def _run(opts: TaskOptions, cfg: Config) -> ExitCode:
         if opts.verbose:
             print(f"⚠ local_degraded: auto-reduced ollama_num_ctx to {cfg.ollama_num_ctx} (L03)", file=sys.stderr)
     # Conversational / Direct Q&A fast-path (Tier-0 locale, zero cloud costs)
-    if not opts.file_args and is_conversational_prompt(opts.prompt):
+    chat = not opts.file_args and is_conversational_prompt(opts.prompt)
+    if not chat and opts.continue_session and not opts.file_args and ollama.reachable and ollama.model_present:
+        # the REPL continues the previous session by default: a new question must not be sent to it as an "answer"
+        chat = score_task(cfg, opts.prompt, root, [], {}, estimate_tokens(opts.prompt)).conversational
+    if chat:
         blackboard, _ = load_blackboard(root)
         ctx = TaskContext(default_routing([]), {}, load_profile(cfg),
                           blackboard_context(blackboard), "", 0)

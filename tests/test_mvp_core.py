@@ -722,6 +722,23 @@ class TestRouterAndCli(TempWorkspace):
         self.assertTrue(router.validate_routing({**data, "conversational": True}, self.ws, CFG, []).conversational)
         self.assertFalse(router.validate_routing({**data, "conversational": "yes"}, self.ws, CFG, []).conversational)
 
+    def test_question_is_not_sent_as_answer_to_the_continued_session(self) -> None:
+        from unittest import mock
+        from ai_core import router
+        up = router.OllamaStatus(True, True)
+        for chat, expect_continue in ((True, False), (False, True)):
+            routing = router.default_routing([])
+            routing.conversational = chat
+            opts = router.TaskOptions("Puoi creare un file?", self.ws, continue_session=True, task_id="t1")
+            with mock.patch.object(router, "ollama_status", return_value=up), \
+                    mock.patch.object(router, "score_task", return_value=routing), \
+                    mock.patch.object(router, "run_conversational_chat",
+                                      return_value=router.Outcome(router.TaskStatus.COMPLETED_UNVERIFIED)), \
+                    mock.patch.object(router, "_continue", return_value=ExitCode.OK) as cont, \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                router.run(opts, CFG)
+            self.assertEqual(cont.called, expect_continue)
+
     def test_decision_matrix(self) -> None:
         from ai_core import router
         all_up = router.Channels("available", frozenset({"gemini", "argon", "claude_gpt"}))
