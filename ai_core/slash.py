@@ -76,10 +76,10 @@ def last_task(root: Path) -> dict | None:
     return tasks[0] if tasks else None
 
 
-def show_changes(st: ReplState, before_task_id: str | None, max_lines: int | None = _CHANGES_LINES) -> None:
+def show_changes(st: ReplState, before_checkpoint: str | None, max_lines: int | None = _CHANGES_LINES) -> None:
     """Print the coloured diff of the task that just ran; silent if it changed nothing (or never ran)."""
     task = last_task(st.root)
-    if not task or task.get("task_id") == before_task_id or not task.get("touched_files") or not task.get("checkpoint_id"):
+    if not task or task.get("checkpoint_id") == before_checkpoint or not task.get("touched_files") or not task.get("checkpoint_id"):
         return
     try:
         diff = diff_since(st.root, task["checkpoint_id"], st.cfg)

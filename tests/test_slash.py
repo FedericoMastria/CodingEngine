@@ -180,26 +180,33 @@ class SlashTests(TempWorkspace):
         with mock.patch.object(slash, "last_task", return_value=self.task("t2")), \
                 mock.patch.object(slash, "diff_since", return_value="\n".join(f"+l{i}" for i in range(100))), \
                 redirect_stdout(buf):
-            slash.show_changes(self.st, before_task_id="t1")
+            slash.show_changes(self.st, before_checkpoint="cp0")
         out = buf.getvalue()
         self.assertIn("changes: a.py", out)
         self.assertLessEqual(len(out.splitlines()), slash._CHANGES_LINES + 2)
 
+    def test_show_changes_works_when_the_repl_reuses_the_task_id(self) -> None:
+        """The REPL continues one session, so every run of a conversation shares its task_id: only the checkpoint is new."""
+        buf = io.StringIO()
+        with mock.patch.object(slash, "last_task", return_value=self.task("same-session", cp="cp2")),                 mock.patch.object(slash, "diff_since", return_value="+new line"), redirect_stdout(buf):
+            slash.show_changes(self.st, before_checkpoint="cp1")  # the previous run of the same task_id had cp1
+        self.assertIn("+new line", buf.getvalue())
+
     def test_show_changes_is_silent_when_nothing_new_or_nothing_changed(self) -> None:
-        for task, before in ((self.task("t1"), "t1"),  # same task as before: the run produced no new one
-                             (self.task("t2", touched=()), "t1"),  # nothing touched
-                             (self.task("t2", cp=None), "t1"),  # no checkpoint to diff against
+        for task, before in ((self.task("t1", cp="cp1"), "cp1"),  # same checkpoint as before: the run produced no new one
+                             (self.task("t2", touched=()), "cp0"),  # nothing touched
+                             (self.task("t2", cp=None), "cp0"),  # no checkpoint to diff against
                              (None, None)):
             buf = io.StringIO()
             with mock.patch.object(slash, "last_task", return_value=task), \
                     mock.patch.object(slash, "diff_since", return_value="+x") as ds, redirect_stdout(buf):
-                slash.show_changes(self.st, before_task_id=before)
+                slash.show_changes(self.st, before_checkpoint=before)
             self.assertEqual((buf.getvalue(), ds.call_count), ("", 0), task)
 
     def test_show_changes_survives_a_diff_error(self) -> None:
         with mock.patch.object(slash, "last_task", return_value=self.task("t2")), \
                 mock.patch.object(slash, "diff_since", side_effect=RuntimeError("git gone")):
-            slash.show_changes(self.st, before_task_id="t1")  # must not raise
+            slash.show_changes(self.st, before_checkpoint="cp0")  # must not raise
 
 
 class PlanTests(TempWorkspace):
@@ -282,6 +289,31 @@ class ReplWiringTests(TempWorkspace):
         with mock.patch.object(router, "run", lambda opts, cfg: seen.append(opts) or ExitCode.OK):
             self.repl(["/channel agy", "/dry-run on", "do something"])
         self.assertEqual([(o.channel, o.dry_run, o.prompt) for o in seen], [("agy", True, "do something")])
+
+    def test_in_repl_flag_is_set_while_the_repl_runs_and_always_reset(self) -> None:
+        seen: list[bool] = []
+
+        def fake_run(opts, cfg):  # noqa: ANN001
+            seen.append(router.IN_REPL)
+            raise RuntimeError("task crashed")
+
+        self.assertFalse(router.IN_REPL)
+        with mock.patch.object(router, "run", fake_run), self.assertRaises(RuntimeError):
+            self.repl(["do something"])
+        self.assertEqual(seen, [True])
+        self.assertFalse(router.IN_REPL)  # even when the REPL dies
+
+    def test_clarification_hint_depends_on_where_it_is_shown(self) -> None:
+        def card(in_repl: bool) -> str:
+            buf = io.StringIO()
+            with redirect_stdout(buf), mock.patch.object(router, "IN_REPL", in_repl):
+                router._print_outcome(router.TaskOptions("q", self.ws), router.Outcome(
+                    TaskStatus.NEEDS_CLARIFICATION, "local", "m", message="which file?", task_id="abc123"))
+            return buf.getvalue()
+
+        self.assertIn("type your answer below", card(True))
+        self.assertNotIn("ai -c", card(True))
+        self.assertIn('ai -c --task-id abc123 "<your answer>"', card(False))  # one-shot CLI users still get the command
 
     def test_unknown_slash_command_never_becomes_a_task(self) -> None:
         with mock.patch.object(router, "run") as run:

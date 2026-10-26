@@ -544,6 +544,137 @@ class WorkerTests(unittest.TestCase):
 
 
 @unittest.skipUnless(tui.AVAILABLE, "prompt_toolkit missing")
+class WordWrapTests(unittest.TestCase):
+    """The window wraps by character; `_wrap` makes every line of output break at spaces instead."""
+
+    ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+    def wrap(self, line: str, width: int) -> list[str]:
+        return tui._wrap(line, width)
+
+    def widths(self, rows: list[str]) -> list[int]:
+        from prompt_toolkit.utils import get_cwidth
+        return [get_cwidth(self.ANSI_RE.sub("", r)) for r in rows]
+
+    def test_short_line_is_untouched(self) -> None:
+        self.assertEqual(self.wrap("   ? short", 80), ["   ? short"])
+        self.assertEqual(self.wrap("", 80), [""])
+
+    def test_breaks_at_spaces_never_inside_a_word(self) -> None:
+        line = "Per i file nuovi, devo usare una sezione SEARCH/REPLACE vuota: conferma che vuoi creare il file " * 2
+        rows = self.wrap(line, 40)
+        self.assertTrue(all(w <= 40 for w in self.widths(rows)), self.widths(rows))
+        self.assertEqual(" ".join(" ".join(r.split()) for r in rows), " ".join(line.split()))  # no word lost or split
+        self.assertTrue(all("SEARCH/REPLACE" in r or "SEARCH/REPL" not in r for r in rows))
+
+    def test_the_reported_case_keeps_search_replace_whole(self) -> None:
+        line = ("   ? Il task richiede la modifica tramite SEARCH/REPLACE. Devo usare un blocco SEARCH/REPLACE con una "
+                "sezione SEARCH vuota per creare il contenuto iniziale?")
+        rows = self.wrap(line, 70)
+        self.assertEqual(sum(r.count("SEARCH/REPLACE") for r in rows), 2)
+
+    def test_continuation_rows_keep_the_leading_indent(self) -> None:
+        rows = self.wrap("   ? " + "parola " * 30, 40)
+        self.assertGreater(len(rows), 2)
+        self.assertTrue(rows[0].startswith("   ? "))
+        self.assertTrue(all(r.startswith("   ") and not r.startswith("    ") for r in rows[1:]), rows)
+
+    def test_no_row_ends_with_a_space(self) -> None:
+        for r in self.wrap("a " * 100, 30):
+            self.assertEqual(r, r.rstrip(" "))
+
+    def test_ansi_codes_are_free_and_stay_attached_to_their_words(self) -> None:
+        line = "\x1b[1mgrassetto lungo\x1b[0m " + "normale " * 20 + "\x1b[36mcoda\x1b[0m"
+        rows = self.wrap(line, 40)
+        self.assertTrue(all(w <= 40 for w in self.widths(rows)))
+        joined = "".join(rows)
+        self.assertEqual(joined.count("\x1b[1m"), 1)
+        self.assertEqual(joined.count("\x1b[0m"), 2)
+        self.assertEqual(self.ANSI_RE.sub("", " ".join(rows)).split(), self.ANSI_RE.sub("", line).split())
+
+    def test_a_word_longer_than_the_row_is_cut_to_fit(self) -> None:
+        url = "https://example.com/" + "a" * 100
+        rows = self.wrap("see " + url, 40)
+        self.assertTrue(all(w <= 40 for w in self.widths(rows)), self.widths(rows))
+        self.assertEqual("".join(rows).replace(" ", ""), ("see" + url))
+
+    def test_a_long_word_with_colour_is_cut_without_losing_the_escape_codes(self) -> None:
+        word = "\x1b[31m" + "x" * 90 + "\x1b[0m"
+        rows = self.wrap(word, 30)
+        self.assertTrue(all(w <= 30 for w in self.widths(rows)))
+        self.assertEqual("".join(rows), word)
+
+    def test_wide_characters_count_two_cells(self) -> None:
+        rows = self.wrap("日本語 " * 20, 20)
+        self.assertTrue(all(w <= 20 for w in self.widths(rows)), self.widths(rows))
+        self.assertEqual("".join(rows).replace(" ", ""), "日本語" * 20)
+
+    def test_very_narrow_window_does_not_wrap_at_all(self) -> None:
+        self.assertEqual(self.wrap("word " * 20, 10), ["word " * 20])  # below 20 columns: leave it to the window
+
+    def test_huge_indent_cannot_make_the_loop_stall(self) -> None:
+        rows = self.wrap(" " * 60 + "word " * 20, 40)
+        self.assertTrue(all(w <= 40 for w in self.widths(rows)), self.widths(rows))
+        self.assertIn("word", " ".join(rows))
+
+    def test_wrapped_lines_in_the_pane_follow_the_width(self) -> None:
+        t = tui.Tui(Path("."), None)
+        t._pane_width = lambda: 60  # type: ignore[method-assign]
+        t._append("  ? " + "parola " * 40 + "\nnext line\n")
+        rows = t._text().split("\n")
+        self.assertGreater(len(rows), 4)
+        self.assertTrue(all(len(r) <= 60 for r in rows))
+        self.assertEqual(rows[-2], "next line")
+        t._pane_width = lambda: 120  # type: ignore[method-assign]
+        self.assertLess(len(t._text().split("\n")), len(rows))  # and it re-wraps on resize
+
+    def test_scroll_math_counts_wrapped_rows(self) -> None:
+        t = tui.Tui(Path("."), None)
+        t._pane_width = lambda: 40  # type: ignore[method-assign]
+        t._append("word " * 60 + "\n")
+        self.assertEqual(t._cursor().y, t._text().count("\n"))
+        self.assertGreater(t._cursor().y, 5)
+
+    def test_selection_rows_are_the_wrapped_rows(self) -> None:
+        copied: list[str] = []
+        t = tui.Tui(Path("."), None)
+        t._pane_width = lambda: 40  # type: ignore[method-assign]
+        t.app = types.SimpleNamespace(invalidate=lambda: None)
+        t._append("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda\n")
+        t._formatted()
+        with mock.patch.object(tui, "_copy", lambda text: copied.append(text) or True):
+            t.sel = ((0, 0), (0, 4))
+            t._copy_selection()
+        self.assertEqual(copied, ["alpha"])
+        self.assertEqual(t._text().split("\n")[0], "alpha beta gamma delta epsilon zeta eta")  # 39 cells, break at a space
+
+    def test_cache_returns_the_same_rows_without_rework(self) -> None:
+        tui._wrap_cached.cache_clear()
+        tui._wrap_cached("word " * 40, 40)
+        tui._wrap_cached("word " * 40, 40)
+        info = tui._wrap_cached.cache_info()
+        self.assertEqual((info.hits, info.misses), (1, 1))
+
+    def test_a_clarification_card_wraps_by_word_in_the_pane(self) -> None:
+        from ai_core import TaskStatus, router
+        t = tui.Tui(Path("."), None)
+        t._pane_width = lambda: 70  # type: ignore[method-assign]
+        msg = ("Il task richiede di creare il file ciao2.txt. Per i file nuovi, devo usare una sezione SEARCH/REPLACE "
+               "vuota. Confermi che vuoi semplicemente creare il file con il codice C all'interno?")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), mock.patch.object(router, "_use_color", return_value=False), \
+                mock.patch.object(router, "IN_REPL", True):
+            router._print_outcome(router.TaskOptions("q", Path(".")),
+                                  router.Outcome(TaskStatus.NEEDS_CLARIFICATION, "local", "qwen", message=msg, task_id="t1"))
+        t._append(buf.getvalue())
+        text = t._text()
+        self.assertIn("SEARCH/REPLACE", text)
+        self.assertTrue(all(len(r) <= 70 for r in text.split("\n")))
+        self.assertIn("type your answer below", text)
+        self.assertNotIn("ai -c --task-id", text)
+
+
+@unittest.skipUnless(tui.AVAILABLE, "prompt_toolkit missing")
 class ReflowTests(unittest.TestCase):
     """Replies are stored as markdown and laid out at display time, so a resize re-wraps them."""
 

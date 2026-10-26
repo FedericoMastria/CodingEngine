@@ -264,6 +264,7 @@ def render_terminal_markdown(text: str, use_color: bool = True) -> str:
             result.append(part)
     return "".join(result)
 
+IN_REPL = False  # set by the interactive `ai >`: hints say "type below" instead of showing a shell command
 MD_DEFER: Callable[[str], str] | None = None  # the TUI sets it: replies are laid out at display time (see render_markdown)
 
 
@@ -1801,7 +1802,10 @@ def _print_outcome(opts: TaskOptions, o: Outcome) -> None:
 
     if o.status == TaskStatus.NEEDS_CLARIFICATION:
         print(f"   {_yellow('?')} {o.message}")
-        print(f"   {_dim('answer with:')} ai -c --task-id {o.task_id} \"<your answer>\"")
+        if IN_REPL:  # the next line typed continues this task: no command to copy
+            print(f"   {_dim('type your answer below')}")
+        else:
+            print(f"   {_dim('answer with:')} ai -c --task-id {o.task_id} \"<your answer>\"")
     elif code != ExitCode.OK and o.message:
         print(f"   {_red('error:')} {o.message}")
 

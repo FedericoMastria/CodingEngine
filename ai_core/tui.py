@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import functools
 import os
 import queue
 import re
@@ -55,6 +56,7 @@ try:
                                        Layout, VSplit, Window)
     from prompt_toolkit.layout.dimension import Dimension
     from prompt_toolkit.mouse_events import MouseButton, MouseEventType
+    from prompt_toolkit.utils import get_cwidth
     from prompt_toolkit.styles import Style
     from prompt_toolkit.widgets import Frame, TextArea
     AVAILABLE = True
@@ -96,6 +98,50 @@ def _copy(text: str) -> bool:
         return False
     finally:
         u32.CloseClipboard()
+
+
+def _wrap(line: str, width: int) -> list[str]:
+    """Break `line` at spaces so no row is wider than `width` cells (ANSI-aware, wide-character aware). Continuation
+    rows keep the leading indent; a word longer than a row is split. The window itself only wraps by character."""
+    if width < 20 or get_cwidth(_ANSI.sub("", line)) <= width:
+        return [line]
+    indent = min(len(line) - len(line.lstrip(" ")), width // 2)
+    pad = " " * indent
+    rows: list[str] = []
+    cur, used = "", 0
+
+    def room() -> int:
+        return width - used
+
+    for chunk in re.findall(r"\s+|\S+", line):
+        if chunk.isspace():
+            if get_cwidth(chunk) <= room():
+                cur, used = cur + chunk, used + get_cwidth(chunk)
+            elif cur.strip():  # a break falls inside this run of spaces: drop it
+                rows.append(cur.rstrip(" "))
+                cur, used = pad, indent
+            continue
+        size = get_cwidth(_ANSI.sub("", chunk))
+        if size > room() and cur.strip():
+            rows.append(cur.rstrip(" "))
+            cur, used = pad, indent
+        if size <= room():
+            cur, used = cur + chunk, used + size
+            continue
+        for tok in re.findall(r"\x1b\[[0-9;]*m|.", chunk):  # longer than a whole row: cut it
+            w = 0 if tok[0] == "\x1b" else get_cwidth(tok)
+            if w > room() and cur.strip():
+                rows.append(cur)
+                cur, used = pad, indent
+            cur, used = cur + tok, used + w
+    rows.append(cur.rstrip(" ") if cur.strip() else cur)
+    return rows
+
+
+@functools.lru_cache(maxsize=8192)
+def _wrap_cached(line: str, width: int) -> tuple[str, ...]:
+    """`_wrap` memoised: the pane re-lays out its whole text whenever it grows, almost always with the same lines."""
+    return tuple(_wrap(line, width))
 
 
 def enabled() -> bool:
@@ -235,25 +281,22 @@ class Tui:
         width = self._pane_width()
         if self._exp and self._exp[0] is self.raw and self._exp[1] == width:
             return self._exp[2]
-        if "\x00" not in self.raw:
-            text = self.raw
-        else:
-            out: list[str] = []
-            for line in self.raw.split("\n"):
-                m = _MD_TOKEN.search(line)
-                if not m:
-                    out.append(line)
-                    continue
-                prefix, n = line[:m.start()], int(m.group(1))
-                indent = len(_ANSI.sub("", prefix))
-                key = (n, width - indent)
-                if n in self.md and key not in self._md_cache:
-                    self._md_cache[key] = router.render_markdown_now(self.md[n], True, width - indent)
-                rendered = self._md_cache.get(key, "").split("\n")
-                out.append(prefix + rendered[0])
-                out.extend(" " * indent + ln if ln else ln for ln in rendered[1:])
-                out[-1] += line[m.end():]
-            text = "\n".join(out)
+        out: list[str] = []
+        for line in self.raw.split("\n"):
+            m = _MD_TOKEN.search(line) if "\x00" in line else None
+            if not m:
+                out.extend(_wrap_cached(line, width))
+                continue
+            prefix, n = line[:m.start()], int(m.group(1))
+            indent = len(_ANSI.sub("", prefix))
+            key = (n, width - indent)
+            if n in self.md and key not in self._md_cache:
+                self._md_cache[key] = router.render_markdown_now(self.md[n], True, width - indent)
+            rendered = self._md_cache.get(key, "").split("\n")
+            out.append(prefix + rendered[0])
+            out.extend(" " * indent + ln if ln else ln for ln in rendered[1:])
+            out[-1] += line[m.end():]
+        text = "\n".join(out)
         self._exp = (self.raw, width, text)
         return text
 

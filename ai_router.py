@@ -179,24 +179,28 @@ def run_repl(root: Path, cfg: Any, args: argparse.Namespace) -> int:
         opts = router.TaskOptions(prompt=prompt, project_root=root, file_args=tuple(files), offline=st.offline,
                                   dry_run=st.dry_run, verbose=st.verbose, agent=False,
                                   continue_session=cont, task_id=last_task_id, channel=st.channel)
-        before = (slash.last_task(root) or {}).get("task_id")
+        before = (slash.last_task(root) or {}).get("checkpoint_id")  # task_id is reused while the REPL continues a session
         router.run(opts, cfg)
         slash.show_changes(st, before)
         bb, _ = session.load_blackboard(root)
         last_task_id = (bb.get("system_identity", {}).get("last_session") or {}).get("task_id") or last_task_id
         return False
 
-    if tui.enabled():
-        return tui.Tui(root, st.channel, mode=st.label).run(step, lambda: router.LAST_ANSWERED_BY)
-    print("CodingEngine REPL — Type a task or command (status, usage, history, undo, new, help, exit).")
-    while True:
-        try:
-            line = input("ai > ")
-        except (EOFError, KeyboardInterrupt):
-            print("\nbye")
-            return ExitCode.OK
-        if step(line):
-            return ExitCode.OK
+    router.IN_REPL = True
+    try:
+        if tui.enabled():
+            return tui.Tui(root, st.channel, mode=st.label).run(step, lambda: router.LAST_ANSWERED_BY)
+        print("CodingEngine REPL — Type a task or command (status, usage, history, undo, new, help, exit).")
+        while True:
+            try:
+                line = input("ai > ")
+            except (EOFError, KeyboardInterrupt):
+                print("\nbye")
+                return ExitCode.OK
+            if step(line):
+                return ExitCode.OK
+    finally:
+        router.IN_REPL = False
 
 
 def main(argv: list[str] | None = None) -> int:
