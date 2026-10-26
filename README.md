@@ -276,6 +276,7 @@ CodingEngine/
 │   ├── config.py               # Typed configuration schema (config.toml)
 │   ├── conpty.py               # Windows ConPTY terminal runner
 │   ├── credit.py               # Quota, rate limits, and 5h/7d window tracking
+│   ├── mdrender.py             # Markdown replies -> ANSI (rich): code highlighting, tables, quotes
 │   ├── patcher.py              # Atomic 2-stage SEARCH/REPLACE patcher
 │   ├── repomap.py              # AST PageRank repository map
 │   ├── review.py               # Multi-perspective code review

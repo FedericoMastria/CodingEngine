@@ -263,6 +263,28 @@ def render_terminal_markdown(text: str, use_color: bool = True) -> str:
             result.append(part)
     return "".join(result)
 
+MD_DEFER: Callable[[str], str] | None = None  # the TUI sets it: replies are laid out at display time (see render_markdown)
+
+
+def render_markdown_now(text: str, use_color: bool = True, width: int | None = None) -> str:
+    """Reply text for the terminal: full markdown through rich (code highlighting, tables, quotes); the regex
+    renderer when colour is off or rich fails, so a rendering problem never loses the answer."""
+    if text and use_color:
+        try:
+            from ai_core.mdrender import render
+            return render(text, width=width)
+        except Exception:
+            pass
+    return render_terminal_markdown(text, use_color)
+
+
+def render_markdown(text: str, use_color: bool = True) -> str:
+    """`render_markdown_now`, or - inside the TUI - a one-line placeholder that the output pane expands to the
+    markdown at its current width, so the reply re-wraps when the window is resized."""
+    if text and use_color and MD_DEFER is not None:
+        return MD_DEFER(text)
+    return render_markdown_now(text, use_color)
+
 def _reply(body: str) -> str:
     """Claude-Code-style reply block on a terminal: bullet on the first line, the rest indented."""
     if not _use_color():
@@ -295,6 +317,11 @@ def emit(opts: TaskOptions, event: str, **data: Any) -> None:
 def say(opts: TaskOptions, text: str) -> None:
     """Human-readable output: stdout normally, stderr in --agent mode (stdout stays pure JSON)."""
     print(text, file=sys.stderr if opts.agent else sys.stdout)
+
+
+def say_md(opts: TaskOptions, text: str) -> None:
+    """`say` for model-written markdown (reviews, plans); raw in --agent mode, where output is a contract."""
+    say(opts, text if opts.agent else render_markdown(text, _use_color()))
 
 
 def _ask(opts: TaskOptions, question: str, choices: str) -> str | None:
@@ -1719,7 +1746,7 @@ def _print_outcome(opts: TaskOptions, o: Outcome) -> None:
     elif o.message:
         body = o.message.strip()
 
-    body = render_terminal_markdown(body, _use_color())
+    body = render_markdown(body, _use_color())
 
     global LAST_ANSWERED_BY
     LAST_ANSWERED_BY = (f"{o.channel}/{o.model}" if o.model else o.channel) if o.channel else ""

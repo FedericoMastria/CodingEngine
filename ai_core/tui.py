@@ -13,6 +13,8 @@ import asyncio
 import ctypes
 import os
 import queue
+import re
+import shutil
 import sys
 import threading
 import time
@@ -20,7 +22,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ai_core import cancel_active, slash
+from ai_core import cancel_active, router, slash
 
 SLASH_COMMANDS = {
     "/help": "show commands", "/status": "system status", "/usage": "usage and quotas",
@@ -36,6 +38,8 @@ _QUIT_WINDOW = 2.0  # seconds within which a second ctrl+c quits
 _REWIND_WINDOW = 1.5  # seconds within which a second esc asks to undo the last task
 _BELL_AFTER_S = 15  # ring the terminal bell when a task that long finishes
 _PASTE_LINES, _PASTE_CHARS = 5, 1000  # bigger pastes collapse to a [Pasted text #n] tag
+_MD_TOKEN = re.compile(r"\x00MD(\d+)\x00")  # placeholder for a markdown reply, expanded at display time
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _MAX_CHARS = 80_000  # shortcut: scrollback is capped, older output is dropped; raise if you need more history
 
 try:
@@ -176,7 +180,11 @@ class Tui:
         self.top: int | None = None  # first visible line while the user scrolled away; None = follow the newest output
         self.output: Any = None  # the output Window (its render_info says what is on screen)
         self._parsed: Any = None
-        self._parsed_len = -1
+        self._parsed_src: str | None = None  # the expanded text `_parsed` was built from
+        self.md: dict[int, str] = {}  # placeholder number -> markdown source of a reply
+        self._md_n = 0
+        self._md_cache: dict[tuple[int, int], str] = {}  # (placeholder, width) -> rendered ANSI
+        self._exp: tuple[str, int, str] | None = None  # (raw it was built from, width, expanded text)
         self.pending: queue.Queue[str] | None = None  # set while a task waits for a y/N answer
         self.answered_by: Callable[[], str] = lambda: ""
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -201,13 +209,58 @@ class Tui:
         self.loop.call_soon_threadsafe(self._append, text)
 
     def _append(self, text: str) -> None:
-        self.raw = (self.raw + text)[-_MAX_CHARS:]
+        raw = self.raw + text
+        if len(raw) > _MAX_CHARS:
+            raw = raw[-_MAX_CHARS:]
+            raw = raw[raw.find("\n") + 1:]  # never keep half a line: a half placeholder would show as control characters
+            self.md = {n: src for n, src in self.md.items() if f"\x00MD{n}\x00" in raw}
+            self._md_cache = {k: v for k, v in self._md_cache.items() if k[0] in self.md}
+        self.raw = raw
         if self.app:
             self.app.invalidate()
 
+    def _defer_md(self, source: str) -> str:
+        """router.MD_DEFER: keep the markdown and print a placeholder line; thread-safe (called by the worker)."""
+        n = self._md_n = self._md_n + 1
+        self.md[n] = source
+        return f"\x00MD{n}\x00"
+
+    def _pane_width(self) -> int:
+        info = self.output.render_info if self.output else None
+        return info.window_width if info else shutil.get_terminal_size((100, 24)).columns
+
+    def _text(self) -> str:
+        """The output as displayed: `raw` with every markdown placeholder laid out for the current pane width.
+        What precedes the placeholder on its line (the reply bullet) becomes the indent of the continuation lines."""
+        width = self._pane_width()
+        if self._exp and self._exp[0] is self.raw and self._exp[1] == width:
+            return self._exp[2]
+        if "\x00" not in self.raw:
+            text = self.raw
+        else:
+            out: list[str] = []
+            for line in self.raw.split("\n"):
+                m = _MD_TOKEN.search(line)
+                if not m:
+                    out.append(line)
+                    continue
+                prefix, n = line[:m.start()], int(m.group(1))
+                indent = len(_ANSI.sub("", prefix))
+                key = (n, width - indent)
+                if n in self.md and key not in self._md_cache:
+                    self._md_cache[key] = router.render_markdown_now(self.md[n], True, width - indent)
+                rendered = self._md_cache.get(key, "").split("\n")
+                out.append(prefix + rendered[0])
+                out.extend(" " * indent + ln if ln else ln for ln in rendered[1:])
+                out[-1] += line[m.end():]
+            text = "\n".join(out)
+        self._exp = (self.raw, width, text)
+        return text
+
     def _formatted(self) -> Any:
-        if self._parsed_len != len(self.raw) or self._parsed is None:
-            self._parsed, self._parsed_len = ANSI(self.raw), len(self.raw)
+        text = self._text()
+        if self._parsed_src is not text or self._parsed is None:
+            self._parsed, self._parsed_src = ANSI(text), text
         if not self.sel:
             return self._parsed
         (r0, c0), (r1, c1) = self.sel
@@ -263,14 +316,14 @@ class Tui:
         self.app.invalidate()
 
     def _cursor(self) -> Point:
-        last = self.raw.count("\n")
+        last = self._text().count("\n")
         return Point(0, last if self.top is None else min(self.top, last))
 
     def _scroll(self, delta: int) -> None:
         """Move the viewport `delta` lines up (negative = down). Sets the window's scroll directly: moving only the
         invisible cursor would not scroll until it left the screen, a whole page of wheel ticks later."""
         info = self.output.render_info if self.output else None
-        lines = self.raw.count("\n") + 1
+        lines = self._text().count("\n") + 1
         if delta < 0 and info and info.displayed_lines[-1] - delta >= lines - 1:  # this move reaches the bottom: follow again
             self.top = None
         else:
@@ -515,9 +568,9 @@ class Tui:
             self.pending = None
 
     def run(self, step: Callable[[str], bool], answered_by: Callable[[], str]) -> int:
-        from ai_core import router
         self.answered_by = answered_by
         router.INPUT_FN = self._ask
+        router.MD_DEFER = self._defer_md
         real_out, real_err = sys.stdout, sys.stderr
         self.app = self._build(step)  # before the swap: prompt_toolkit binds its output to the real stdout
         sys.stdout, sys.stderr = _Out(self.append), _Out(self.append, style_lines=True)
@@ -526,6 +579,7 @@ class Tui:
         finally:
             sys.stdout, sys.stderr = real_out, real_err
             router.INPUT_FN = input
+            router.MD_DEFER = None
         print("bye")
         return 0
 

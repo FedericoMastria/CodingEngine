@@ -161,7 +161,7 @@ def _cross_review(root: Path, cfg: Config, diffs: list[tuple[str, str]], opts: T
     prompt = f"{REVIEW_SYSTEM}\n\n<diff>\n{''.join(d for _, d in diffs)}\n</diff>"
     out = _read_only_run(root, cfg, opts, prompt, order, "review")
     if out.adapter and out.adapter.result_text:
-        router.say(opts, out.adapter.result_text.strip())
+        router.say_md(opts, out.adapter.result_text.strip())
     router.emit(opts, "review", mode="cross", channel=out.channel, status=str(out.status),
                 report=out.adapter.result_text if out.adapter else "", message=out.message)
     if out.status != TaskStatus.COMPLETED_UNVERIFIED:
@@ -182,7 +182,7 @@ def plan(root: Path, cfg: Config, opts: TaskOptions, task: str) -> ExitCode:
     order = {"anthropic": [a], "agy": [b]}.get(opts.channel or "", [a, b])
     out = _read_only_run(root, cfg, opts, f"{PLAN_SYSTEM}\n\n<task>\n{task}\n</task>", order, "plan")
     if out.adapter and out.adapter.result_text:
-        router.say(opts, out.adapter.result_text.strip())
+        router.say_md(opts, out.adapter.result_text.strip())
     if out.status != TaskStatus.COMPLETED_UNVERIFIED:
         router.say(opts, f"✖ {out.status}: {out.message}")
     return router.EXIT_FOR_STATUS.get(out.status, ExitCode.FAILED)
@@ -229,6 +229,6 @@ def review(root: Path, cfg: Config, mode: str, opts: TaskOptions, target: str | 
     except OllamaError as exc:
         router.say(opts, f"✖ local model unavailable: {exc}")
         return ExitCode.OFFLINE_UNAVAILABLE
-    router.say(opts, report)
+    router.say_md(opts, report)
     router.emit(opts, "review", mode=mode, report=report, files=[p for p, _ in diffs])
     return ExitCode.OK

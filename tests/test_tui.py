@@ -5,10 +5,15 @@ Run: uv run --no-project --python ">=3.14" python -m unittest tests.test_tui -v
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
+import re
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -536,6 +541,178 @@ class WorkerTests(unittest.TestCase):
         t, _ = self.run_main("spin\r" + PAUSE + "queued one\r" + PAUSE + ESC + PAUSE + "/exit\r", step)
         self.assertEqual(seen, ["spin", "/exit"])  # "queued one" was dropped by the interrupt
         self.assertIn("queued (#1)", t.raw)
+
+
+@unittest.skipUnless(tui.AVAILABLE, "prompt_toolkit missing")
+class ReflowTests(unittest.TestCase):
+    """Replies are stored as markdown and laid out at display time, so a resize re-wraps them."""
+
+    LONG = " ".join(f"parola{i}" for i in range(40))
+    ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+    def setUp(self) -> None:
+        from ai_core import router
+        self.router = router
+        self.t = tui.Tui(Path("."), None)
+        self.width = 80
+        self.t._pane_width = lambda: self.width  # type: ignore[method-assign]
+        for patcher in (mock.patch.object(router, "MD_DEFER", self.t._defer_md),
+                        mock.patch.object(router, "_safe_char", lambda char, fallback: char)):  # test console is cp1252
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def reply(self, markdown: str) -> None:
+        """What router._print_outcome prints for a reply: bullet + (deferred) body."""
+        self.t._append(self.router._reply(self.router.render_markdown(markdown, True)) + "\n")
+
+    def lines(self) -> list[str]:
+        return [self.ANSI_RE.sub("", ln) for ln in self.t._text().split("\n")]
+
+    def test_reply_is_stored_as_a_placeholder_not_as_laid_out_text(self) -> None:
+        with mock.patch.object(self.router, "_use_color", return_value=True):
+            self.reply(self.LONG)
+        self.assertIn("\x00MD1\x00", self.t.raw)
+        self.assertNotIn("parola5", self.t.raw)
+        self.assertEqual(self.t.md[1], self.LONG)
+
+    def test_resize_rewraps_the_same_reply(self) -> None:
+        with mock.patch.object(self.router, "_use_color", return_value=True):
+            self.reply(self.LONG)
+        wide = self.lines()
+        self.width = 50
+        narrow = self.lines()
+        self.assertLess(len(wide), len(narrow))
+        self.assertTrue(all(len(ln) <= 50 for ln in narrow), [len(ln) for ln in narrow])
+        self.width = 120
+        self.assertLessEqual(len(self.lines()), len(wide))  # and it widens again
+        self.assertEqual(" ".join(" ".join(ln.split()) for ln in narrow).replace("● ", "").strip(), self.LONG)  # no word lost
+
+    def test_bullet_stays_on_the_first_line_and_the_rest_is_indented(self) -> None:
+        with mock.patch.object(self.router, "_use_color", return_value=True):
+            self.reply("# Title\n\n" + self.LONG)
+        body = [ln for ln in self.lines() if ln.strip()]
+        self.assertTrue(body[0].startswith("● Title"))
+        self.assertTrue(all(ln.startswith("  ") for ln in body[1:]))
+
+    def test_text_around_the_reply_is_untouched(self) -> None:
+        with mock.patch.object(self.router, "_use_color", return_value=True):
+            self.t._append("before\n")
+            self.reply("**x**")
+            self.t._append("after\n")
+        self.assertEqual([ln for ln in self.lines() if ln], ["before", "● x", "after"])
+
+    def test_two_replies_keep_their_own_source(self) -> None:
+        with mock.patch.object(self.router, "_use_color", return_value=True):
+            self.reply("first reply")
+            self.reply("second reply")
+        self.assertEqual([ln for ln in self.lines() if ln], ["● first reply", "● second reply"])
+
+    def test_layout_is_cached_per_width_not_redone_every_frame(self) -> None:
+        with mock.patch.object(self.router, "_use_color", return_value=True):
+            self.reply(self.LONG)
+        calls = []
+        real = self.router.render_markdown_now
+        with mock.patch.object(self.router, "render_markdown_now", lambda *a, **k: calls.append(a) or real(*a, **k)):
+            for _ in range(5):
+                self.t._text()
+                self.t._append("more output\n")  # streaming output: raw changes, the reply must not be re-rendered
+            self.width = 60
+            self.t._text()
+            self.t._text()
+        self.assertEqual(len(calls), 2)  # once per width
+
+    def test_scrollback_cut_never_leaves_half_a_placeholder_and_prunes_old_sources(self) -> None:
+        with mock.patch.object(self.router, "_use_color", return_value=True):
+            self.reply("old reply")
+        self.t._append("x" * 100 + "\n" * 5 + ("y" * 99 + "\n") * (tui._MAX_CHARS // 100))
+        self.assertEqual(self.t.md, {})
+        self.assertNotIn("\x00", self.t._text())
+        self.assertLessEqual(len(self.t.raw), tui._MAX_CHARS)
+        self.assertTrue(self.t.raw.startswith("y"))  # cut at a line boundary
+
+    def test_a_kept_reply_survives_the_cut(self) -> None:
+        with mock.patch.object(self.router, "_use_color", return_value=True):
+            self.t._append("z" * (tui._MAX_CHARS - 500) + "\n")
+            self.reply("recent reply")
+            self.t._append("q" * 600 + "\n")
+        self.assertIn(1, self.t.md)
+        self.assertIn("● recent reply", self.lines())
+
+    def test_unknown_placeholder_is_dropped_quietly(self) -> None:
+        self.t._append("a \x00MD99\x00 b\n")
+        self.assertEqual(self.t._text().split("\n")[0], "a  b")
+
+    def test_scroll_math_uses_the_laid_out_line_count(self) -> None:
+        with mock.patch.object(self.router, "_use_color", return_value=True):
+            self.reply("# T\n\n" + self.LONG)
+        self.assertEqual(self.t._cursor().y, self.t._text().count("\n"))
+        self.assertGreater(self.t._text().count("\n"), self.t.raw.count("\n"))
+
+    def test_selection_copies_the_rendered_text(self) -> None:
+        copied: list[str] = []
+        with mock.patch.object(self.router, "_use_color", return_value=True), \
+                mock.patch.object(tui, "_copy", lambda text: copied.append(text) or True):
+            self.t.app = types.SimpleNamespace(invalidate=lambda: None)
+            self.reply("# Title\n\nsome **bold** text")
+            self.t._formatted()
+            rows = [i for i, ln in enumerate(self.lines()) if "bold" in ln]
+            self.t.sel = ((rows[0], 0), (rows[0], 30))
+            self.t._copy_selection()
+        self.assertEqual(copied, ["  some bold text"])  # rendered, without markers or ANSI
+
+    def test_without_the_hook_replies_are_laid_out_immediately(self) -> None:
+        with mock.patch.object(self.router, "MD_DEFER", None), mock.patch.object(self.router, "_use_color", return_value=True):
+            out = self.router.render_markdown("# T\n\nbody", True)
+        self.assertNotIn("\x00", out)
+        self.assertIn("body", self.ANSI_RE.sub("", out))
+
+    def test_run_installs_and_removes_the_hook(self) -> None:
+        seen: list[object] = []
+
+        def fake_run(coro) -> None:  # noqa: ANN001
+            seen.append(self.router.MD_DEFER)
+            coro.close()
+
+        with mock.patch.object(self.router, "MD_DEFER", None), create_app_session(output=DummyOutput(), input=create_pipe_input().__enter__()), \
+                mock.patch("asyncio.run", fake_run), mock.patch.object(self.router, "INPUT_FN", input):
+            t = tui.Tui(Path("."), None)
+            with contextlib.redirect_stdout(io.StringIO()):
+                t.run(lambda line: False, lambda: "")
+            self.assertEqual(seen, [t._defer_md])
+            self.assertIsNone(self.router.MD_DEFER)
+
+    def test_a_task_printing_a_reply_through_the_worker_ends_up_laid_out(self) -> None:
+        from ai_core import TaskStatus
+
+        async def go() -> tui.Tui:
+            with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()):
+                t = tui.Tui(Path("."), None)
+
+                def step(line: str) -> bool:
+                    self.router._print_outcome(self.router.TaskOptions("q", Path(".")), self.router.Outcome(
+                        TaskStatus.COMPLETED_UNVERIFIED, message="## Plan\n\n```py\nprint(1)\n```\n\n- **one**"))
+                    return line == "/exit"
+
+                t.app = t._build(step)
+                stdout = mock.patch.object(sys, "stdout", tui._Out(t.append))
+                stdout.start()
+                self.addCleanup(stdout.stop)
+                with mock.patch.object(self.router, "MD_DEFER", t._defer_md):
+                    main = asyncio.create_task(t._main(step))
+                    await asyncio.sleep(0.3)
+                    pipe.send_text("go\r")
+                    await asyncio.sleep(1.0)
+                    pipe.send_text("/exit\r")
+                    await asyncio.wait_for(main, 8)
+                return t
+
+        with mock.patch.object(self.router, "_use_color", return_value=True):
+            t = asyncio.run(go())
+        text = self.ANSI_RE.sub("", t._text())
+        self.assertIn("print(1)", text)
+        self.assertIn("• one", text)
+        self.assertNotIn("```", text)
+        self.assertNotIn("\x00", text)
 
 
 @unittest.skipUnless(tui.AVAILABLE, "prompt_toolkit missing")
