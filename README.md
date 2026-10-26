@@ -20,6 +20,7 @@ It routes software engineering tasks seamlessly between a local **Tier-0 local m
 - **Strict Budget & Quota Tracking:** Real-time 5h and 7d quota monitoring via ConPTY statusLine hooks; dynamic failover and cooldown rotation.
 - **Deterministic Verification Engine:** Automated multi-level verification (L1 syntax, L2 typecheck/build, L3 targeted tests) with pre-task baseline diffing.
 - **Non-Negotiable Safety Invariants:** Sandboxed checkpoints stored outside the workspace, safe selective undo, and environment scrubbing.
+- **WSL Projects:** Projects that live inside a WSL distro (`\\wsl.localhost\<distro>\...`) are detected automatically. Git, verification and the secret vault run inside the distro; both cloud channels work (see [Working with WSL projects](#4-optional-working-with-wsl-projects)).
 
 ---
 
@@ -130,6 +131,18 @@ ai --undo
 ai --undo --task-id 20261026-114500-a1b2
 ```
 
+### Projects in WSL
+
+```powershell
+# From Windows, point --dir at the project's UNC path (use ai.exe, not ai.cmd)
+ai --dir \\wsl.localhost\Ubuntu\home\<user>\<project> "fix the failing test" +src\app.py
+
+# Or cd there first (PowerShell can) and run ai without --dir
+cd \\wsl.localhost\Ubuntu\home\<user>\<project>
+ai --status --agent              # JSON status, includes "wsl": "<distro>:/home/<user>/<project>"
+ai --dry-run --verbose "..."     # prints "→ WSL: <distro>:/home/<user>/<project>"
+```
+
 ---
 
 ## Installation & Setup
@@ -142,6 +155,7 @@ ai --undo --task-id 20261026-114500-a1b2
 - **Cloud CLIs (Optional for Cloud Dispatch):**
   - Claude Code CLI (`claude.exe`)
   - Google Antigravity CLI (`agy.exe`)
+- **WSL projects (Optional):** WSL2 with a distro such as Ubuntu — see [step 4](#4-optional-working-with-wsl-projects)
 
 ### 1. Clone & Install
 
@@ -185,6 +199,54 @@ python skills/install_skills.py
 skills\ai-skill-setup.cmd
 ```
 
+### 4. (Optional) Working with WSL projects
+
+There is no switch to turn on: when the project root is under `\\wsl.localhost\<distro>\...` or `\\wsl$\<distro>\...` the engine switches to WSL mode by itself (both spellings are normalised to the first one, so checkpoints and `--undo` always find each other). The engine, Ollama and the checkpoint store (`~/.ai_checkpoints`) stay on Windows; every *project* command runs inside the distro through `wsl.exe -d <distro> --cd <dir> -e ...`.
+
+**What you need to set up**
+
+1. **WSL2 and a distro** (for example Ubuntu), with `git` installed in it.
+2. **The project's own toolchain inside the distro.** Verification runs there: L3 uses the project's `.venv/bin/python` if it exists, otherwise `python3` (the distro has no `python` on its bare `PATH`): a `verify_l3_command` that starts with `python` gets that substitution, any other command you set in `config.toml` runs as-is inside the distro. L2 (`tsc --noEmit`) is detected only when `tsconfig.json` and `node_modules/typescript` are in the project root (a sub-folder such as `ui/` needs `verify_l2_command`).
+3. **Claude Code inside the distro (Channel A).** Claude Code refuses every edit when its working directory is a Windows network path, so the engine runs the distro's own install. Install it in the distro and log in with your **subscription account, not an API key**:
+
+   ```bash
+   # inside the distro
+   curl -fsSL https://claude.ai/install.sh | bash   # or your usual installer
+   claude                                           # log in once
+   ```
+
+   The engine finds it with a login shell, so `~/.local/bin` does not need to be on a non-interactive `PATH`. API keys are removed from the environment on the Windows side and again inside the distro (`env -u`).
+4. **Antigravity (Channel B): nothing to install.** The Windows `agy.exe` is used: it asks for a login when started in a network folder, so the engine starts it from `%USERPROFILE%\.ai_agy_cwd` and adds the project with `--add-dir`.
+5. **Use `ai.exe`** (installed by step 1), not `ai.cmd`: `cmd.exe` cannot hold a network folder as its working directory and falls back to `C:\Windows`. The engine detects this and stops with a clear message.
+
+**Check it works**
+
+```powershell
+ai --dir \\wsl.localhost\<distro>\home\<user>\<project> --dry-run --verbose "describe the project" 
+```
+
+It should print `→ WSL: <distro>:/home/<user>/<project>`. A task with `--offline` exercises everything except the cloud channels.
+
+**What behaves differently in WSL mode**
+
+| Area | Behaviour |
+|---|---|
+| Git, checkpoints, undo | Git runs inside the distro (LF line endings and Linux file modes are preserved, byte-exact undo). Snapshots stay in `~/.ai_checkpoints` on Windows, never in the project. |
+| Secret files (Channel B) | The vault moves them into the distro's home (`~/.ai_vault_<id>`, mode `700`) for the duration of the task and restores them afterwards. |
+| File names | Case-sensitive, as on Linux (`Foo.py` and `foo.py` are different files). |
+| First call after idle | WSL shuts its VM down when idle (`vmIdleTimeout` in `.wslconfig`); the first call then takes a few seconds longer. |
+
+**Troubleshooting**
+
+| Message | Fix |
+|---|---|
+| `claude is not installed in WSL distro '<distro>': install it there and log in` | Do step 3. Until then Channel A is skipped for WSL projects (a warning is printed once). |
+| `WSL distro '<distro>' not found (installed: ...)` | Check the name with `wsl -l -q`. |
+| `cmd.exe cannot run in a UNC folder` | Use `ai.exe`, or pass `--dir \\wsl.localhost\...`. |
+| `Git refuses this repository ... dubious ownership` | Applies to Windows repositories owned by another user; WSL projects use the distro's own Git and do not hit it. |
+
+**Not verified yet:** `--cross` / `--ultra` reviews and resuming a cloud session (`ai -c`) on WSL projects. Mirrored networking is not required.
+
 ---
 
 ## Directory Structure
@@ -206,12 +268,13 @@ CodingEngine/
 │   ├── security.py             # Environment sanitization & secret scrubber
 │   ├── tui.py                  # Terminal UI, markdown rendering, & ANSI styling
 │   ├── vault.py                # NTFS volume-isolated secret vault
-│   └── verification.py         # Multi-level verification (L1/L2/L3)
+│   ├── verification.py         # Multi-level verification (L1/L2/L3)
+│   └── wsl.py                  # WSL mode: detection, canonical root, `project_argv`, distro `claude`
 ├── docs/                       # Architecture specs and plans
 │   ├── CodingEngineArchitecture_v1.0.md # Complete v1.0 specification
 │   └── superpowers/            # Implementation plans and design specs
 ├── skills/                     # Agent skills (ai-orchestrator)
-├── tests/                      # Full test suite (170+ unit & integration tests)
+├── tests/                      # Full test suite (220+ unit & integration tests)
 ├── pyproject.toml              # Project metadata and CLI entrypoints
 └── README.md
 ```
