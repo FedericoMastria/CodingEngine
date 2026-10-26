@@ -15,7 +15,9 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import dataclasses
@@ -356,6 +358,25 @@ def ollama_status(cfg: Config, timeout: float = 3.0) -> OllamaStatus:
         return status
     except OllamaError as exc:
         return OllamaStatus(False, error=str(exc))
+
+
+def start_ollama(cfg: Config, wait: float = 20.0) -> str | None:
+    """Spawn `ollama serve` when the default local server is down. Returns an error string, or None once it answers."""
+    parsed = urllib.parse.urlparse(cfg.ollama_url)
+    if parsed.hostname not in ("127.0.0.1", "localhost") or parsed.port != 11434:
+        return "not the default local server"  # custom URL/port: `ollama serve` would not answer there
+    exe = shutil.which("ollama") or str(Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe")
+    try:
+        subprocess.Popen([exe, "serve"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW)
+    except OSError as exc:
+        return f"cannot start ollama: {exc}"
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if ollama_status(cfg, timeout=1.0).reachable:
+            return None
+        time.sleep(0.5)
+    return "ollama serve did not answer in time"
 
 
 def ollama_chat(
@@ -1375,6 +1396,9 @@ def _preflight(opts: TaskOptions, cfg: Config) -> tuple[OllamaStatus | None, Exi
         say(opts, f"✖ Git {op} in progress: complete or abort it before running ai")
         return None, ExitCode.FAILED
     ollama = ollama_status(cfg, timeout=3.0 if opts.offline else 1.5)
+    if not ollama.reachable and start_ollama(cfg) is None:
+        say(opts, "ℹ Ollama was down: started `ollama serve`")
+        ollama = ollama_status(cfg, timeout=3.0)
     if opts.offline and not (ollama.reachable and ollama.model_present):
         why = ollama.error or f"model {cfg.ollama_model} not installed"
         _print_outcome(opts, Outcome(TaskStatus.LOCAL_MODEL_UNAVAILABLE, "local", cfg.ollama_model, why))
