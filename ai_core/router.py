@@ -64,11 +64,12 @@ ROUTING_SCHEMA: dict[str, Any] = {
         "reasoning_depth": {"type": "integer", "enum": [1, 2, 3, 4]},
         "needs_repo_search": {"type": "boolean"},
         "creates_new_files": {"type": "boolean"},
+        "conversational": {"type": "boolean"},
         "task_type": {"type": "string", "enum": list(TASK_TYPES)},
         "target_files": {"type": "array", "items": {"type": "string"}},
         "routing_notes": {"type": ["string", "null"]},
     },
-    "required": ["files_scope", "reasoning_depth", "needs_repo_search", "creates_new_files",
+    "required": ["files_scope", "reasoning_depth", "needs_repo_search", "creates_new_files", "conversational",
                  "task_type", "target_files", "routing_notes"],
 }
 SCORING_SYSTEM = (
@@ -77,6 +78,9 @@ SCORING_SYSTEM = (
     "reasoning_depth: 1 trivial/mechanical, 2 standard, 3 hard (subtle bugs, design), 4 deep architecture.\n"
     "needs_repo_search: true if relevant files are unknown and must be searched for.\n"
     "creates_new_files: true only if the task explicitly asks to create new files.\n"
+    "conversational: true if the message is chat, a greeting, or a question to be answered in words (about capabilities, "
+    "concepts, the project, 'can you X?') and asks for NO change to any file; false if it asks to actually edit, create, "
+    "fix or run something, even politely.\n"
     "target_files: project-relative paths that must be edited or created. If creates_new_files is true, target_files "
     "MUST include the relative path of the new file(s) to create (if a specific filename is not given, infer a sensible filename from the prompt, e.g. 'ciao.txt', 'notes.txt', 'script.py').\n"
     "routing_notes: short technical notes useful to a cloud agent, or null."
@@ -133,6 +137,7 @@ class Routing:
     target_files: list[Path]
     routing_notes: str | None
     source: str  # "ollama" | "default"
+    conversational: bool = False  # the scorer judged it a question/chat, not a coding task
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,7 +499,8 @@ def validate_routing(data: Any, root: Path, cfg: Config, user_targets: list[Path
     unique = list({path_key(p): p for p in targets}.values())
     return Routing(data["files_scope"], data["reasoning_depth"], data["needs_repo_search"],
                    data["creates_new_files"], data["task_type"], unique,
-                   notes[:2000] if isinstance(notes, str) and notes.strip() else None, "ollama")
+                   notes[:2000] if isinstance(notes, str) and notes.strip() else None, "ollama",
+                   data.get("conversational") is True)
 
 
 def _prompt_mentions(prompt: str, paths: list[Path], root: Path) -> bool:
@@ -879,9 +885,10 @@ def run_local(opts: TaskOptions, cfg: Config, ctx: TaskContext, prompt: str | No
                 ctx.contents[inferred] = None
                 inferred_hint = f"\n[Nota: il file da creare è '{_rel(inferred, root)}'. Procedi direttamente con la creazione del file e del contenuto richiesto senza chiedere conferme sul nome.]\n"
         if not routing.target_files:
-            if not routing.creates_new_files and not routing.needs_repo_search:
-                return run_conversational_chat(opts, cfg, ctx, prompt)
             declined = [d for d, ok in ctx.new_dir_answers.items() if not ok]
+            # a "create" verb with no inferable filename is a question ("Puoi creare file?"), not a patch: answer locally
+            if not routing.needs_repo_search and not declined:
+                return run_conversational_chat(opts, cfg, ctx, prompt)
             out.message = (f"directory {', '.join(declined)} does not exist and creating it was not approved"
                            if declined else "no target files: name them with +path/to/file")
             return out
@@ -1379,6 +1386,18 @@ def run(opts: TaskOptions, cfg: Config) -> ExitCode:
         return ExitCode.OFFLINE_UNAVAILABLE
 
 
+def _converse(opts: TaskOptions, cfg: Config, ctx: TaskContext) -> ExitCode:
+    """Tier-0 chat answer: no checkpoint, no cloud, no patch."""
+    decision = Decision("local", cfg.ollama_model, "conversational / direct Q&A [Tier-0 locale]")
+    if opts.dry_run:
+        return _dry_run_report(opts, cfg, ctx, decision)
+    emit(opts, "routing", channel="local", model=cfg.ollama_model, reason=decision.reason)
+    if opts.verbose:
+        print(f"→ local/{cfg.ollama_model}: {decision.reason}", file=sys.stderr)
+    _print_outcome(opts, run_conversational_chat(opts, cfg, ctx))
+    return ExitCode.OK
+
+
 def _preflight(opts: TaskOptions, cfg: Config) -> tuple[OllamaStatus | None, ExitCode | None]:
     """Phase 0: offline latch, vault journal recovery, Git state, Ollama reachability."""
     root = opts.project_root
@@ -1431,15 +1450,7 @@ def _run(opts: TaskOptions, cfg: Config) -> ExitCode:
         ctx = TaskContext(default_routing([]), {}, load_profile(cfg),
                           blackboard_context(blackboard), "", 0)
         ctx.tokens = estimate_tokens(opts.prompt)
-        decision = Decision("local", cfg.ollama_model, "conversational / direct Q&A [Tier-0 locale]")
-        if opts.dry_run:
-            return _dry_run_report(opts, cfg, ctx, decision)
-        emit(opts, "routing", channel="local", model=cfg.ollama_model, reason=decision.reason)
-        if opts.verbose:
-            print(f"→ local/{cfg.ollama_model}: {decision.reason}", file=sys.stderr)
-        outcome = run_conversational_chat(opts, cfg, ctx)
-        _print_outcome(opts, outcome)
-        return ExitCode.OK
+        return _converse(opts, cfg, ctx)
 
     if opts.continue_session:
         return _continue(opts, cfg, ollama)
@@ -1490,6 +1501,8 @@ def _run(opts: TaskOptions, cfg: Config) -> ExitCode:
         ctx.routing = score_task(cfg, opts.prompt, root, targets, ctx.contents, ctx.tokens,
                                  cold=ollama.gpu_full is None, repo_map=ctx.repo_map,
                                  confirm_new_dir=new_dir_confirmer(opts, ctx.new_dir_answers))
+    if ctx.routing.conversational and not targets and not opts.extra_directives:
+        return _converse(opts, cfg, ctx)  # a question the keyword fast path missed ("Puoi creare file?")
     if opts.extra_directives and ctx.routing.task_type != "debug":
         ctx.routing.task_type = "debug"  # --fix is debugging by definition
     for p in ctx.routing.target_files:

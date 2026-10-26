@@ -714,6 +714,14 @@ class TestRouterAndCli(TempWorkspace):
         with self.assertRaises(ValueError):
             router.validate_routing({**data, "task_type": "hack"}, self.ws, CFG, [])
 
+    def test_scorer_conversational_flag_is_optional_and_strictly_true(self) -> None:
+        from ai_core import router
+        data = {"files_scope": 1, "reasoning_depth": 2, "needs_repo_search": False, "creates_new_files": False,
+                "task_type": "debug", "target_files": [], "routing_notes": None}
+        self.assertFalse(router.validate_routing(data, self.ws, CFG, []).conversational)  # old payloads: a task
+        self.assertTrue(router.validate_routing({**data, "conversational": True}, self.ws, CFG, []).conversational)
+        self.assertFalse(router.validate_routing({**data, "conversational": "yes"}, self.ws, CFG, []).conversational)
+
     def test_decision_matrix(self) -> None:
         from ai_core import router
         all_up = router.Channels("available", frozenset({"gemini", "argon", "claude_gpt"}))
