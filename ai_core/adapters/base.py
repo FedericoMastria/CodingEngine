@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
-from ai_core import TaskStatus, kill_process_tree
+from ai_core import TaskStatus, kill_process_tree, track
 
 CLARIFICATION_DIRECTIVE = (
     "Se incontri ambiguità architetturali o requisiti mancanti, NON indovinare. Fermati PRIMA di "
@@ -112,10 +112,10 @@ def stream_process(
     output); Ctrl+C or a timeout kills the whole process tree so no orphan keeps editing files.
     """
     try:
-        proc = subprocess.Popen(
+        proc = track(subprocess.Popen(
             list(cmd), cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             encoding="utf-8", errors="replace", env=dict(env),
-        )
+        ))
     except FileNotFoundError as exc:
         raise AdapterError(f"CLI not found: {cmd[0]}") from exc
     except PermissionError as exc:  # WinError 5: blocked by ACL / SmartScreen / AV

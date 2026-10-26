@@ -11,7 +11,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from ai_core import ExitCode
+from ai_core import ExitCode, router
 from ai_core.config import Config
 from ai_core.router import OllamaError, TaskOptions, _ask, _exec_options, emit, interactive, ollama_chat, say
 from ai_core.security import SecretFinding, is_secret_file, sanitize_subprocess_env, scan_secrets
@@ -131,14 +131,14 @@ def commit(root: Path, cfg: Config, opts: TaskOptions) -> ExitCode:
         if not interactive(opts):
             say(opts, f"✖ cannot generate a commit message: {exc}")
             return ExitCode.FAILED
-        message = input(f"local model unavailable ({exc}). Commit message: ").strip() + "\n"
+        message = router.INPUT_FN(f"local model unavailable ({exc}). Commit message: ").strip() + "\n"
         if not message.strip():
             return ExitCode.FAILED
     if interactive(opts):
         say(opts, f"\n{message}")
         choice = _ask(opts, "[y]es commit, [e]dit subject, [n]o?", "yen")
         if choice == "e":
-            subject = input("subject: ").strip()
+            subject = router.INPUT_FN("subject: ").strip()
             message = f"{subject}\n" + message.partition("\n")[2] if subject else message
         elif choice != "y":
             return ExitCode.FAILED

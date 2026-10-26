@@ -112,8 +112,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_repl(root: Path, cfg: Any, args: argparse.Namespace) -> int:
     """Interactive multi-turn command loop for `ai >` (spec §8, inter-prompt continuity)."""
-    from ai_core import router, session, tui
+    from ai_core import router, session, slash, tui
     last_task_id: str | None = None
+    st = slash.ReplState(root, cfg, args.channel, args.offline, args.dry_run, args.verbose)  # /channel, /offline, /dry-run edit it
 
     def step(line: str) -> bool:
         """Handle one REPL line; True = exit."""
@@ -152,18 +153,18 @@ def run_repl(root: Path, cfg: Any, args: argparse.Namespace) -> int:
             router.show_usage(cfg, as_json=False)
             return False
         if cmd == "undo":
-            base = router.TaskOptions("", root, offline=args.offline, dry_run=args.dry_run,
-                                      verbose=args.verbose, agent=False, channel=args.channel)
-            router.undo(root, cfg, None, None, base)
+            router.undo(root, cfg, None, None, st.options())
             return False
         if cmd in ("help", "?"):
             rows = [("/status", "Show system status"), ("/usage", "Show usage and quotas"),
                     ("/history", "Show recent task history"), ("/new", "Start a fresh conversation"),
-                    ("/undo", "Revert last checkpoint"), ("/exit", "Exit"),
-                    ("<task>", "Run a task, e.g. fix bug in +src/calc.py")]
+                    ("/undo", "Revert last checkpoint (esc esc)"), *((f"/{n}", d) for n, d in slash.COMMANDS.items()),
+                    ("/exit", "Exit"), ("<task>", "Run a task, e.g. fix bug in +src/calc.py")]
             print(router._bold("Commands"))
             for name, desc in rows:
                 print(f"  {router._cyan(f'{name:<9}')} {router._dim(desc)}")
+            return False
+        if slash.run(st, line):
             return False
         words = line.split()
         splat_err = detect_powershell_splatting(words)
@@ -175,16 +176,18 @@ def run_repl(root: Path, cfg: Any, args: argparse.Namespace) -> int:
         if not prompt:
             return False
         cont = bool(last_task_id)
-        opts = router.TaskOptions(prompt=prompt, project_root=root, file_args=tuple(files), offline=args.offline,
-                                  dry_run=args.dry_run, verbose=args.verbose, agent=False,
-                                  continue_session=cont, task_id=last_task_id, channel=args.channel)
+        opts = router.TaskOptions(prompt=prompt, project_root=root, file_args=tuple(files), offline=st.offline,
+                                  dry_run=st.dry_run, verbose=st.verbose, agent=False,
+                                  continue_session=cont, task_id=last_task_id, channel=st.channel)
+        before = (slash.last_task(root) or {}).get("task_id")
         router.run(opts, cfg)
+        slash.show_changes(st, before)
         bb, _ = session.load_blackboard(root)
         last_task_id = (bb.get("system_identity", {}).get("last_session") or {}).get("task_id") or last_task_id
         return False
 
     if tui.enabled():
-        return tui.Tui(root, args.channel).run(step, lambda: router.LAST_ANSWERED_BY)
+        return tui.Tui(root, st.channel, mode=st.label).run(step, lambda: router.LAST_ANSWERED_BY)
     print("CodingEngine REPL — Type a task or command (status, usage, history, undo, new, help, exit).")
     while True:
         try:

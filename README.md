@@ -96,6 +96,22 @@ ai -c "now add unit tests for that edge case"
 ai -c --task-id 20261026-114500-a1b2 "proceed with step 2"
 ```
 
+**Inside the REPL** (full-screen, wheel scrolls, drag selects and copies):
+
+| Key | Action |
+|---|---|
+| `Enter` / `Alt+Enter` | send / new line (the box wraps and grows to 8 rows) |
+| `Esc` | interrupt the running task (kills its agent processes, drops queued lines); with a draft: clear it |
+| `Esc Esc` (idle) | undo the last task (`/undo`, asks first) |
+| `Ctrl+C` | interrupt; with a draft clear it; twice to quit |
+| `Ctrl+R` | search history (again for older matches) |
+| `Tab` on `+path` | complete project files |
+| `Ctrl+L` | clear the output pane |
+
+Large pastes collapse to `[Pasted text #1 +40 lines]` and are sent in full. After a task that changed files, a coloured diff summary is shown (`/diff` for all of it).
+
+Commands: `/review [local|cross|ultra|ponytail] [target]`, `/commit`, `/diff`, `/fix [cmd]`, `/plan <task>` (read-only plan from a cloud agent: claude plan mode / `agy --mode plan`), `/adr`, `/channel auto|anthropic|agy|local`, `/offline` (one-way for the session), `/dry-run`, `/gc`, plus `/status /usage /history /new /clear /undo /exit`. The status bar shows the live channel and `OFFLINE` / `dry-run`.
+
 ### Self-Healing & Debugging
 
 ```powershell
@@ -266,6 +282,7 @@ CodingEngine/
 │   ├── router.py               # 4-phase decision engine & dispatch loop
 │   ├── runner.py               # Task execution & `ait` / `--fix` loops
 │   ├── security.py             # Environment sanitization & secret scrubber
+│   ├── slash.py                # REPL slash commands (/review, /plan, /channel, /offline, /diff ...)
 │   ├── tui.py                  # Terminal UI, markdown rendering, & ANSI styling
 │   ├── vault.py                # NTFS volume-isolated secret vault
 │   ├── verification.py         # Multi-level verification (L1/L2/L3)

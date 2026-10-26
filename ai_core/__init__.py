@@ -76,3 +76,21 @@ def kill_process_tree(proc: subprocess.Popen) -> None:
         )
     if proc.poll() is None:
         proc.kill()
+
+
+ACTIVE_PROCS: set[subprocess.Popen] = set()
+
+
+def track(proc: subprocess.Popen) -> subprocess.Popen:
+    """Register a long-running child so `cancel_active` (TUI interrupt) can end it."""
+    ACTIVE_PROCS.difference_update([p for p in ACTIVE_PROCS if p.poll() is not None])
+    ACTIVE_PROCS.add(proc)
+    return proc
+
+
+def cancel_active() -> int:
+    """Kill every tracked child tree (agent CLIs, verification, tracked commands). Returns how many were alive."""
+    alive = [p for p in list(ACTIVE_PROCS) if p.poll() is None]
+    for p in alive:
+        kill_process_tree(p)
+    return len(alive)

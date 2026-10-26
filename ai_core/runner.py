@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any
 
-from ai_core import ExitCode, kill_process_tree
+from ai_core import ExitCode, kill_process_tree, track
 from ai_core.adapters.base import SYSTEMATIC_DEBUGGING_DIRECTIVE
 from ai_core.checkpoint import write_json_atomic
 from ai_core.config import CONTEXT_DIR_NAME, Config, ensure_context_dir
@@ -59,8 +59,8 @@ def run_tracked(root: Path, argv: list[str], *, stdout_to_stderr: bool = False) 
     out_tail: deque[str] = deque(maxlen=2000)
     err_tail: deque[str] = deque(maxlen=2000)
     try:
-        proc = subprocess.Popen(project_argv(root, argv) if wsl_target(root) else resolve_command(argv), cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                encoding="utf-8", errors="replace", env=sanitize_subprocess_env(os.environ, warn=False))
+        proc = track(subprocess.Popen(project_argv(root, argv) if wsl_target(root) else resolve_command(argv), cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      encoding="utf-8", errors="replace", env=sanitize_subprocess_env(os.environ, warn=False)))
     except (FileNotFoundError, PermissionError) as exc:  # missing tool / WinError 5
         code, out, err = 127, "", f"cannot run {argv[0]}: {exc}"
         print(err, file=sys.stderr)

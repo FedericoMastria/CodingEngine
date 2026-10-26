@@ -16,7 +16,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ai_core import TaskStatus, kill_process_tree
+from ai_core import TaskStatus, kill_process_tree, track
 from ai_core.config import CONTEXT_DIR_NAME, Config
 from ai_core.security import sanitize_subprocess_env
 from ai_core.wsl import project_argv, wsl_python, wsl_target
@@ -55,10 +55,10 @@ class VerificationResult:
 
 def _run(cmd: Sequence[str], cwd: Path, timeout_s: int, level: int) -> LevelResult:
     try:
-        proc = subprocess.Popen(
+        proc = track(subprocess.Popen(
             project_argv(cwd, cmd), cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             encoding="utf-8", errors="replace", env=sanitize_subprocess_env(os.environ, warn=False),
-        )
+        ))
     except (FileNotFoundError, PermissionError) as exc:  # missing tool, WinError 5 on the executable
         return LevelResult(level, SKIPPED, output=f"command unavailable: {exc}")
     try:

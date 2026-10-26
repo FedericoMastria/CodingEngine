@@ -28,6 +28,7 @@ Full architecture specification: [CodingEngineArchitecture_v1.0.md](CodingEngine
 - `ai_core/session.py`: Blackboard I/O, `pending_sessions` (`ai -c`), single-task lock (PID-reuse safe).
 - `ai_core/adr.py`: ADR lifecycle (`proposed` / `active` / `rejected`, source tracking).
 - `ai_core/repomap.py`: AST repo-map with import-graph PageRank and incremental cache.
+- `ai_core/tui.py` + `ai_core/slash.py`: full-screen REPL (prompt_toolkit) and its slash commands. Esc/Ctrl+C interrupt = `cancel_active()` (kills every child registered with `ai_core.track`) + `KeyboardInterrupt` injected into the task thread, i.e. the same path as a console Ctrl+C: the `finally` blocks in `run_cloud` finalize the checkpoint, so `/undo` works after an interrupt. Any new long-running `subprocess.Popen` must be wrapped in `track(...)` and any `input()` in REPL-reachable code must use `router.INPUT_FN`. `/offline` calls `enforce_offline()` (one-way latch). Tests drive it headless through a prompt_toolkit pipe: `tests/test_tui.py`, `tests/test_slash.py`.
 - `ai_core/wsl.py`: WSL mode. `wsl_target`/`canonical_root` detect and normalise `\\wsl.localhost` paths; `project_argv` runs every *project* command (git, L2/L3 verification, `ait`, vault chmod, and Claude itself) inside the distro via `wsl.exe -d <distro> --cd <dir> -e`; `linux_claude` finds the distro's `claude`. `agy` and Ollama stay Windows processes.
 - `ai_core/vault.py`: Same-volume NTFS vault for secret files (Channel B), journal + `ai --recover`.
 - `ai_core/patcher.py`: Atomic 2-stage SEARCH/REPLACE for the local branch.
