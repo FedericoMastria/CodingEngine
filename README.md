@@ -86,6 +86,9 @@ It routes software engineering tasks seamlessly between a local **Tier-0 local m
 # Run a single task (auto-detects target files or use +file)
 ai "fix off-by-one error in +src/calculator.py"
 
+# Delete a file (local branch only; cloud agents cannot delete and will ask for --channel local). `ai --undo` brings it back
+ai --offline "delete +old_notes.txt"
+
 # Launch the interactive multi-turn REPL
 ai
 
@@ -129,6 +132,9 @@ ai --fix "npm test"
 ai --review
 ai --review --ponytail
 
+# A path narrows the review to that file or folder (--cross sends one cloud prompt and refuses a diff that is too large)
+ai --review src/
+
 # Generate conventional commits with automatic secret scanning & verification
 ai --commit
 ```
@@ -139,7 +145,7 @@ ai --commit
 # Check current system status, model allocation, and Ollama server health
 ai --status
 
-# Inspect real-time 5h/7d quotas across Claude and Antigravity
+# Inspect real-time 5h/7d quotas across Claude and Antigravity (stale Antigravity data, older than usage_max_age_min = 60, is refreshed automatically)
 ai --usage --refresh
 
 # Undo changes from the most recent task (or specific task ID)
