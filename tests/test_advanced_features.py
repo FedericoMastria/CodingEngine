@@ -558,6 +558,21 @@ class TestReview(TempWorkspace):
         self.assertTrue(calls[-1].startswith("Merge"))
         self.assertIn(f"report {len(calls)}", out.getvalue())
 
+    def test_review_target_narrows_the_diff(self) -> None:
+        seen: list[str] = []
+
+        def fake_chat(_cfg: object, messages: list[dict[str, str]], **kw: object) -> tuple[str, str]:
+            seen.append(messages[1]["content"])
+            return "ok", "stop"
+
+        with mock.patch("ai_core.review.ollama_chat", side_effect=fake_chat), redirect_stdout(io.StringIO()):
+            self.assertEqual(review(self.ws, CFG, "local", router.TaskOptions("", self.ws), "a.py"), ExitCode.OK)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(review(self.ws, CFG, "local", router.TaskOptions("", self.ws), "nope/"), ExitCode.OK)
+        self.assertTrue(seen and "a.py" in seen[0] and "new.py" not in seen[0])
+        self.assertIn("nothing to review", out.getvalue())
+
     def test_cross_review_uses_the_other_channel_read_only(self) -> None:
         (self.ws / ".ai_context").mkdir()
         bb, _ = load_blackboard(self.ws)
@@ -574,6 +589,14 @@ class TestReview(TempWorkspace):
         with mock.patch.object(router, "run_cloud", side_effect=fake_run_cloud), redirect_stdout(io.StringIO()):
             code = _cross_review(self.ws, CFG, collect_diff(self.ws, CFG), router.TaskOptions("", self.ws))
         self.assertEqual((code, seen), (ExitCode.OK, [("claude", True)]))
+
+    def test_cross_review_refuses_an_oversized_diff_before_spending(self) -> None:
+        with mock.patch.object(router, "run_cloud") as cloud, mock.patch("ai_core.review._CROSS_MAX_TOKENS", 10), \
+                redirect_stdout(io.StringIO()) as out:
+            code = _cross_review(self.ws, CFG, [("a.py", "x" * 400)], router.TaskOptions("", self.ws))
+        self.assertEqual(code, ExitCode.USAGE)
+        self.assertIn("too large", out.getvalue())
+        cloud.assert_not_called()
 
     def test_ultra_never_runs_in_agent_mode(self) -> None:
         with mock.patch("ai_core.review.subprocess.run") as run, redirect_stderr(io.StringIO()):
@@ -669,6 +692,12 @@ class TestRunner(TempWorkspace):
                  f'  File "C:\\Python\\Lib\\site-packages\\x.py", line 9\n'
                  f'  File "{self.ws / "pkg" / "core.py"}", line 7, in run\nValueError: bad')
         self.assertEqual(extract_targets(trace, self.ws, CFG), ["pkg/core.py", "app.py"])
+
+    def test_fix_of_a_command_that_cannot_start_spends_no_model_call(self) -> None:
+        with mock.patch("ai_core.runner.run") as model, silenced():
+            code = fix(self.ws, CFG, ["definitely-not-a-command-xyz"], router.TaskOptions("", self.ws))
+        self.assertEqual(code, ExitCode.USAGE)
+        model.assert_not_called()
 
     def test_fix_dispatches_debug_task_and_reruns_allowlisted_command(self) -> None:
         flag = self.ws / "fixed.flag"
@@ -1078,6 +1107,11 @@ class TestRouterPhase2(TempWorkspace):
             captured.append((decision, kw))
             return router.Outcome(TaskStatus.COMPLETED_UNVERIFIED, decision.channel, decision.model)
 
+        dry = router.TaskOptions("SQLite", self.ws, agent=True, continue_session=True, task_id=task_id, dry_run=True)
+        with mock.patch.object(router, "compute_channels", return_value=self.UP), \
+                mock.patch.object(router, "run_cloud", side_effect=done) as cloud, silenced():
+            self.assertEqual(router.run(dry, self.cfg), ExitCode.OK)
+        cloud.assert_not_called()  # the REPL continues the last session on every line: dry-run must hold there too
         cont = router.TaskOptions("SQLite", self.ws, agent=True, continue_session=True, task_id=task_id)
         with mock.patch.object(router, "compute_channels", return_value=self.UP), \
                 mock.patch.object(router, "run_cloud", side_effect=done), silenced():
@@ -1155,6 +1189,23 @@ class TestRouterPhase2(TempWorkspace):
         self.assertEqual(blocks, [EditBlock("README.md", "", "# Demo")])
         self.assertEqual(apply_blocks({"README.md": None}, blocks), {"README.md": "# Demo\n"})
 
+    def test_delete_block_removes_the_file_and_is_reversible(self) -> None:
+        from ai_core.patcher import EditBlock, PatchError, apply_blocks, parse_blocks
+        blocks = parse_blocks("README.md\n<<<<<<< DELETE\n>>>>>>> REPLACE\n")
+        self.assertEqual(blocks, [EditBlock("README.md", "", "", True)])
+        self.assertEqual(apply_blocks({"README.md": "x\n"}, blocks), {"README.md": None})
+        with self.assertRaises(PatchError):  # nothing to delete / also edited in the same patch
+            apply_blocks({"README.md": None}, blocks)
+        with self.assertRaises(PatchError):
+            apply_blocks({"README.md": "x\n"}, [*blocks, EditBlock("README.md", "x", "y")])
+        target = self.ws / "gone.txt"
+        write(target, "keep me\n")
+        rels = {"gone.txt": target}
+        written = router._write_patch(rels, {"gone.txt": "keep me\n"}, {"gone.txt": None})
+        self.assertEqual((target.exists(), written), (False, {"gone.txt": ""}))
+        router._revert_patch(rels, {"gone.txt": "keep me\n"}, written)
+        self.assertEqual(target.read_text(encoding="utf-8"), "keep me\n")
+
     def test_prompt_paths_inside_a_single_quoted_argument(self) -> None:
         # Regression (real PowerShell run): `ai "... in calc.py"` is ONE argv element.
         from ai_router import split_prompt
@@ -1165,6 +1216,20 @@ class TestRouterPhase2(TempWorkspace):
         prompt, files = split_prompt(["fix +src/m.py and add +1 to the counter"], self.ws)
         self.assertEqual((prompt, files), ("fix src/m.py and add +1 to the counter", ["src/m.py"]))
         self.assertEqual(split_prompt(["refactor", "+new_module.py"], self.ws)[1], ["new_module.py"])
+        # a marked dotfile inside a sentence is a target (so a secret one is refused); unmarked it is just text
+        self.assertEqual(split_prompt(["read +.env and add +.5 here"], self.ws)[1], [".env"])
+        write(self.ws / ".env", "")
+        self.assertEqual(split_prompt(["do not touch .env"], self.ws)[1], [])
+        self.assertEqual(split_prompt(["what is in +src/m.py? and +calc.py!"], self.ws)[1], ["src/m.py", "calc.py"])
+        with self.assertRaises(security.PathValidationError):
+            security.validate_target_files(["a?.py"], self.ws, cfgmod.Config(), creates_new_files=True)
+
+    def test_ask_on_eof_ends_the_unanswered_prompt_line(self) -> None:
+        opts = router.TaskOptions(prompt="x", project_root=self.ws)
+        out = io.StringIO()
+        with mock.patch("sys.stdin.isatty", return_value=True), mock.patch("builtins.input", side_effect=EOFError),                 mock.patch.object(router, "INPUT_FN", input), redirect_stdout(out):
+            self.assertIsNone(router._ask(opts, "Go? [y/N]", "yn"))
+        self.assertEqual(out.getvalue(), "\n")
 
     def test_clarification_marker_precedence(self) -> None:
         # Regression (real Qwen run): the model wrote the marker, changed its mind and emitted a patch.
@@ -1209,6 +1274,7 @@ class TestRouterPhase2(TempWorkspace):
         self.assertIsNotNone(rep["channel_b"]["claude_gpt"]["cooldown_until"])
         with silenced():
             self.assertEqual(ai_router.main(["--usage", "--b-cooldown", "bogus", "5"]), ExitCode.USAGE)
+            self.assertEqual(ai_router.main(["--usage", "--b-cooldown", "gemini", "-3"]), ExitCode.USAGE)
             self.assertEqual(ai_router.main(["--usage"]), 0)
 
     def test_cli_passes_fix_and_ait_commands_verbatim(self) -> None:
@@ -1239,6 +1305,30 @@ class TestRealUsage(TempWorkspace):
         self.sl = statusline
         self.cm = CreditManager(CFG, self.ws.parent / "state.json")
         self.agy_data = json.loads((FIXTURES / "agy_statusline_1.4.7.json").read_text(encoding="utf-8"))
+
+    def test_project_root_never_climbs_into_home(self) -> None:
+        home = self.ws / "home"
+        proj = home / "work" / "app"
+        proj.mkdir(parents=True)
+        (home / ".ai_context").mkdir()  # stray marker in the home folder
+        with mock.patch.object(cfgmod, "HOME", home):
+            self.assertEqual(cfgmod.find_project_root(proj), proj)
+            (home / "work" / ".git").mkdir()
+            self.assertEqual(cfgmod.find_project_root(proj), home / "work")  # a real marker below home still wins
+
+    def test_background_refresh_is_detached_once_and_only_when_stale(self) -> None:
+        cfg = dataclasses.replace(CFG, usage_max_age_min=60)
+        self.assertTrue(self.sl.agy_capture_stale(cfg))  # never captured
+        self.capture("agy", self.agy_data)
+        self.assertFalse(self.sl.agy_capture_stale(cfg))
+        old = time.time() - 3 * 3600
+        os.utime(self.sl.capture_path("agy"), (old, old))
+        self.assertTrue(self.sl.agy_capture_stale(cfg))
+        with mock.patch("subprocess.Popen") as popen:
+            self.assertTrue(self.sl.check_and_spawn_background_usage_refresh(cfg))
+            self.assertFalse(self.sl.check_and_spawn_background_usage_refresh(cfg), "marker blocks a second agy")
+        self.assertEqual(popen.call_count, 1)
+        self.assertIn("--refresh", popen.call_args.args[0])
 
     def capture(self, cli: str, data: dict) -> str:
         out = io.StringIO()

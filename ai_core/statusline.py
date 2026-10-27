@@ -121,6 +121,14 @@ def install_hook(cli: str, exe: Path) -> str:
     return f"ok     {path}"
 
 
+def _hook_env(sanitize: Any) -> dict[str, str]:
+    """Env for agy and our detached refresh: agy runs our hook (a Python launcher), and a `__PYVENV_LAUNCHER__`
+    inherited from a venv python makes that hook die in `site` (measured: refresh timed out only from a venv)."""
+    env = dict(sanitize(os.environ, warn=False, cloud=True))
+    env.pop("__PYVENV_LAUNCHER__", None)
+    return env
+
+
 def refresh_agy(cwd: Path, timeout_s: float = 45.0) -> bool:
     """Open interactive agy in a pseudo-console WITHOUT any prompt until its status line renders
     (verified: 0 input / 0 output tokens), then close it. True when a fresh capture arrived."""
@@ -140,7 +148,7 @@ def refresh_agy(cwd: Path, timeout_s: float = 45.0) -> bool:
         except (KeyError, ValueError):
             return False
 
-    run_in_conpty(["agy"], cwd=str(cwd), env=sanitize_subprocess_env(os.environ, warn=False, cloud=True),
+    run_in_conpty(["agy"], cwd=str(cwd), env=_hook_env(sanitize_subprocess_env),
                   timeout_s=timeout_s, done=lambda o: time.monotonic() - t0 > 2 and fresh(o))
     return fresh("")
 
@@ -175,22 +183,44 @@ def load(cli: str) -> dict[str, Any] | None:
         return None
 
 
-def check_and_spawn_background_usage_refresh(cfg: Any, home: Path | None = None) -> bool:
-    """Spawn background refresh of agy quota if older than usage_max_age_min (Q04, §7.A)."""
-    import threading
-    h = HOME if home is None else home
-    agy_file = h / ".ai_usage" / "agy.json"
-    stale = True
-    if agy_file.is_file():
-        try:
-            mtime = agy_file.stat().st_mtime
-            max_age_s = getattr(cfg, "usage_max_age_min", 15) * 60
-            if (time.time() - mtime) < max_age_s:
-                stale = False
-        except OSError:
-            pass
-    if stale:
-        t = threading.Thread(target=refresh_agy, args=(h,), daemon=True)
-        t.start()
+def agy_refresh_due(cfg: Any) -> bool:
+    """Stale capture and no attempt (successful or not) in the last 15 min: a broken hook must not cost 45 s per command."""
+    import time
+    try:
+        if time.time() - (usage_dir() / "agy.refreshing").stat().st_mtime < 900:
+            return False
+    except OSError:
+        pass
+    return agy_capture_stale(cfg)
+
+
+def agy_capture_stale(cfg: Any) -> bool:
+    """True when ~/.ai_usage/agy.json is missing or older than `usage_max_age_min`."""
+    import time
+    try:
+        return time.time() - capture_path("agy").stat().st_mtime >= getattr(cfg, "usage_max_age_min", 60) * 60
+    except OSError:
         return True
-    return False
+
+
+def check_and_spawn_background_usage_refresh(cfg: Any) -> bool:
+    """After a task: when the agy capture is stale, refresh it in a detached `ai --usage --refresh` (Q04, §7.A).
+
+    Detached, not a thread: a one-shot `ai "task"` exits right after and would kill a daemon thread
+    before agy rendered. A marker file keeps concurrent tasks from opening agy twice."""
+    import subprocess
+    import time
+
+    from ai_core.security import is_offline, sanitize_subprocess_env
+
+    marker = usage_dir() / "agy.refreshing"
+    script = Path(__file__).resolve().parents[1] / "ai_router.py"
+    if is_offline() or not script.is_file() or not agy_refresh_due(cfg):
+        return False
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen([sys.executable, str(script), "--usage", "--refresh"], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags,
+                     env=_hook_env(sanitize_subprocess_env))
+    return True

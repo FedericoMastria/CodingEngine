@@ -139,6 +139,8 @@ def fix(root: Path, cfg: Config, argv: list[str], base: TaskOptions) -> ExitCode
         if code == 0:
             say(base, f"✔ `{' '.join(argv)}` passes: nothing to fix")
             return ExitCode.OK
+        if err.startswith("cannot run "):  # typo / missing tool: there is no failure output to fix, don't spend a model call
+            return ExitCode.USAGE
         record: dict[str, Any] = {"command": argv, "exit_code": code, "stdout_tail": out, "stderr_tail": err}
     elif (loaded := load_last_error(root)) is None:
         say(base, "✖ nothing to fix: pass a command (ai --fix pytest -x) or run it first with `ait <command>`")

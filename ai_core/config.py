@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import os
 import tomllib
 import typing
@@ -89,7 +90,7 @@ class Config:
     checkpoint_max_keep: int = 10
     checkpoint_retention_days: int = 7
     checkpoint_max_total_mb: int = 50
-    usage_max_age_min: int = 15
+    usage_max_age_min: int = 60  # agy quota capture older than this is refreshed (after tasks, and by --usage)
     checkpoint_exclude_dirs: list[str] = field(default_factory=lambda: [
         "node_modules", ".venv", "venv", "target", "dist", "build", ".next", ".nuxt", "__pycache__",
         ".pytest_cache", ".mypy_cache", ".ruff_cache", ".gradle", "bin", "obj", "coverage",
@@ -179,10 +180,13 @@ def load_config(project_root: Path) -> Config:
 def find_project_root(start: Path) -> Path:
     """Monorepo-safe discovery (§9.1): nearest `.git`/`.ai_context`, then a build manifest, then `start`."""
     start = Path(os.path.normpath(start.resolve()))
-    for candidate in (start, *start.parents):
+    # A marker in the home folder or a drive root (dotfiles repo, stray .ai_context) must not swallow every
+    # project below it: repo-map and checkpoints would span the whole disk. Climbing stops below them.
+    parents = list(itertools.takewhile(lambda p: p != HOME.resolve() and p.parent != p, start.parents))
+    for candidate in (start, *parents):
         if (candidate / ".git").exists() or (candidate / CONTEXT_DIR_NAME).is_dir():
             return candidate
-    for candidate in (start, *start.parents):
+    for candidate in (start, *parents):
         if any((candidate / m).is_file() for m in _BUILD_MANIFESTS) or any(candidate.glob("*.sln")):
             return candidate
     return start

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -13,9 +14,12 @@ from ai_core import ExitCode
 from ai_core.config import ConfigError, find_project_root, load_config
 from ai_core.wsl import WslError, canonical_root, wsl_target
 
-_TRAILING_PUNCT = ",;:)]}'\""
+_TRAILING_PUNCT = ",;:)]}'\"?!"
 # ai's own flags allowed right after --fix; the first other token starts the command line.
 _FIX_OWN_FLAGS = frozenset({"--offline", "--agent", "--json", "--verbose", "-v", "--dry-run"})
+
+
+_DOTFILE = re.compile(r"\.[A-Za-z_][\w.-]*")  # `+.env`: no inner dot, but clearly a file name
 
 
 def _looks_like_path(token: str) -> bool:
@@ -49,7 +53,7 @@ def split_prompt(words: list[str], root: Path) -> tuple[str, list[str]]:
         tokens = []
         for token in arg.split(" "):
             bare = token.rstrip(_TRAILING_PUNCT)
-            if len(bare) > 1 and bare[0] in "+@" and (standalone or _looks_like_path(bare[1:])):
+            if len(bare) > 1 and bare[0] in "+@" and (standalone or _looks_like_path(bare[1:]) or _DOTFILE.fullmatch(bare[1:])):
                 token, bare = token[1:], bare[1:]
                 files.append(bare.rstrip(".") or bare)
             elif _looks_like_path(bare):

@@ -71,7 +71,8 @@ class TempWorkspace(unittest.TestCase):
         for target, attr, value in ((cfgmod, "CHECKPOINTS_ROOT", self.store),
                                     (cfgmod, "STATE_PATH", tmp / "ai_state.json"),
                                     (vault, "VAULT_PARENT", tmp),
-                                    (statusline, "USAGE_DIR", tmp / "ai_usage")):
+                                    (statusline, "USAGE_DIR", tmp / "ai_usage"),
+                                    (statusline, "refresh_agy", lambda *_a, **_k: False)):  # never open the real agy
             patcher = mock.patch.object(target, attr, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -165,6 +166,13 @@ class TestSecretScrubber(unittest.TestCase):
             "x = 'sk-short'", "token = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
         ])
         self.assertEqual(scan_secrets(benign), [])
+
+    def test_scan_is_linear_on_long_words(self) -> None:
+        # Regression: a minified/base64 line of one long word took minutes (quadratic regex) and hung every dispatch.
+        import time
+        t0 = time.monotonic()
+        scan_secrets("x" * 1_000_000 + "\n" + "token" * 20_000)
+        self.assertLess(time.monotonic() - t0, 5)
 
     def test_high_entropy_assignment(self) -> None:
         findings = scan_secrets('client_secret = "Zx8fQ2pLm9Vt4Rk7Wn3Yb6Hj1Cd5Ge0S"')
@@ -648,6 +656,18 @@ class TestOfflineInvariant(TempWorkspace):
                 adapter.run_task(TaskRequest("t", "p", self.ws, "haiku"))
         popen.assert_not_called()
 
+    def test_status_after_offline_latch_reports_cloud_as_unavailable(self) -> None:
+        # Regression: REPL `/offline` then `/status` raised OfflineViolationError and killed the session.
+        from ai_core import router
+        security.enforce_offline()
+        stub = mock.Mock(reachable=False, model_present=False, gpu_full=None, error="down")
+        out = io.StringIO()
+        with mock.patch.object(router, "ollama_status", return_value=stub), redirect_stdout(out):
+            self.assertEqual(router.show_status(self.ws, CFG, as_json=True), ExitCode.OK)
+        info = json.loads(out.getvalue().strip().splitlines()[-1])
+        self.assertIn("physically disabled", info["claude"])
+        self.assertIn("physically disabled", info["agy"])
+
     def test_offline_requires_loopback_ollama(self) -> None:
         require_loopback_url("http://127.0.0.1:11434")
         require_loopback_url("http://localhost:11434")
@@ -771,6 +791,17 @@ class TestRouterAndCli(TempWorkspace):
         self.assertEqual(pick(dataclasses.replace(local, reasoning_depth=3), 99999, ch=none)[0], "none")
         # --offline wins over everything.
         self.assertEqual(pick(dataclasses.replace(local, reasoning_depth=4), 99999, offline=True)[0], "local")
+
+    def test_scoring_prompt_stays_small_for_one_huge_line(self) -> None:
+        # Regression: a 60 MB single-line log has no lines to cut, so all of it went to Ollama and timed out.
+        from ai_core import router
+        target = self.ws / "huge.log"
+        reply = json.dumps({"files_scope": 1, "reasoning_depth": 1, "needs_repo_search": False,
+                            "creates_new_files": False, "task_type": "debug", "target_files": [], "routing_notes": None})
+        with mock.patch.object(router, "ollama_chat", return_value=(reply, "stop")) as chat, redirect_stderr(io.StringIO()):
+            router.score_task(CFG, "t", self.ws, [target], {target: "x" * 5_000_000}, 1_250_000)
+        sent = chat.call_args.args[1][1]["content"]
+        self.assertLess(len(sent), CFG.scoring_full_content_max_tokens * 6)
 
     def test_cold_model_gets_load_allowance(self) -> None:
         # Regression: measured cold start = 48.7 s load + 19.9 s warm-up; a 25 s cap aborted the load forever.

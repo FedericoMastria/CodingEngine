@@ -366,7 +366,7 @@ class CreditManager:
             "agy": {"captured_at": (agy_rec or {}).get("captured_at"), "plan": ((agy_rec or {}).get("data") or {}).get(
                 "plan_tier"), "windows": {
                 n: {"remaining_pct": w["remaining_pct"], "resets_at": w["resets_at"].isoformat() if w["resets_at"] else None}
-                for n, w in statusline.agy_windows(agy_rec).items()}},
+                for n, w in statusline.agy_windows(agy_rec).items() if not w["resets_at"] or w["resets_at"] > now}},
         }
         for name in b_usage:
             b_usage[name]["blocked"] = self.channel_b_block(name, now)

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 _SEARCH = re.compile(r"^<{5,9} SEARCH\s*$")
 _DIVIDER = re.compile(r"^={5,9}\s*$")
 _REPLACE = re.compile(r"^>{5,9} REPLACE\s*$")
+_DELETE = re.compile(r"^<{5,9} DELETE\s*$")  # "path / <<<<<<< DELETE / >>>>>>> REPLACE" removes the file
 _FILE_TAG = re.compile(r'<file\s+path="([^"]+)"[^>]*>(?:\s*</file>)?')  # models sometimes echo the input tag
 
 
@@ -30,6 +31,7 @@ class EditBlock:
     path: str
     search: str
     replace: str
+    delete: bool = False
 
 
 def parse_blocks(text: str) -> list[EditBlock]:
@@ -38,7 +40,8 @@ def parse_blocks(text: str) -> list[EditBlock]:
     blocks: list[EditBlock] = []
     i = 0
     while i < len(lines):
-        if not _SEARCH.match(lines[i]):
+        deleting = bool(_DELETE.match(lines[i]))
+        if not (deleting or _SEARCH.match(lines[i])):
             i += 1
             continue
         path = next((c.strip().strip("`*:").strip() for c in reversed(lines[:i])
@@ -47,6 +50,14 @@ def parse_blocks(text: str) -> list[EditBlock]:
             path = m[1]  # still checked against the allow-list in apply_blocks
         if not path:
             raise PatchError(f"SEARCH block at line {i + 1} has no file path")
+        if deleting:
+            try:
+                end = next(j for j in range(i + 1, len(lines)) if _REPLACE.match(lines[j]))
+            except StopIteration:
+                raise PatchError(f"unterminated DELETE block for {path}") from None
+            blocks.append(EditBlock(path, "", "", True))
+            i = end + 1
+            continue
         try:
             mid = next(j for j in range(i + 1, len(lines)) if _DIVIDER.match(lines[j]))
             end = next(j for j in range(mid + 1, len(lines)) if _REPLACE.match(lines[j]))
@@ -99,8 +110,8 @@ def apply_block(text: str, block: EditBlock) -> str:
     return "\n".join(file_lines[:k] + new + file_lines[k + n:])
 
 
-def apply_blocks(originals: dict[str, str | None], blocks: list[EditBlock]) -> dict[str, str]:
-    """Return the new content of every edited file; `None` original = file does not exist yet.
+def apply_blocks(originals: dict[str, str | None], blocks: list[EditBlock]) -> dict[str, str | None]:
+    """Return the new content of every edited file (`None` = deleted); `None` original = file does not exist yet.
 
     Line endings are compared LF-normalized and restored to each file's native style (CRLF on Windows).
     """
@@ -114,6 +125,7 @@ def apply_blocks(originals: dict[str, str | None], blocks: list[EditBlock]) -> d
         folded.setdefault(k.replace("\\", "/").lower(), []).append(k)
     work: dict[str, str] = {}
     crlf: dict[str, bool] = {}
+    deleted: set[str] = set()
     for block in blocks:
         wanted = block.path.replace("\\", "/").removeprefix("./")
         matches = folded.get(wanted.lower(), [])
@@ -124,8 +136,13 @@ def apply_blocks(originals: dict[str, str | None], blocks: list[EditBlock]) -> d
             original = originals[path] or ""
             crlf[path] = "\r\n" in original
             work[path] = original.replace("\r\n", "\n")
+        if block.delete or path in deleted:
+            if originals[path] is None or sum(b.path == block.path for b in blocks) > 1:
+                raise PatchError(f"{block.path}: cannot delete a file that does not exist or is also edited")
+            deleted.add(path)
+            continue
         work[path] = apply_block(work[path], block)
-    return {p: t.replace("\n", "\r\n") if crlf[p] else t for p, t in work.items()}
+    return {p: None if p in deleted else t.replace("\n", "\r\n") if crlf[p] else t for p, t in work.items()}
 
 _CODE_BLOCK = re.compile(r"```(?:[a-zA-Z0-9_-]+)?\s*\n(.*?)\n```", re.DOTALL)
 

@@ -86,13 +86,18 @@ SCORING_SYSTEM = (
     "MUST include the relative path of the new file(s) to create (if a specific filename is not given, infer a sensible filename from the prompt, e.g. 'ciao.txt', 'notes.txt', 'script.py').\n"
     "routing_notes: short technical notes useful to a cloud agent, or null."
 )
+NO_DELETE_DIRECTIVE = (
+    "Non hai uno strumento per cancellare file. Se il task richiede di cancellarne uno, NON svuotarlo: emetti "
+    "[NEEDS_CLARIFICATION]: serve --channel local per cancellare <file>."
+)
 LOCAL_SYSTEM = (
     "You are a precise coding agent. Edit ONLY the files provided. Output ONLY SEARCH/REPLACE blocks:\n\n"
     "{path}\n<<<<<<< SEARCH\nexact existing lines, verbatim, enough to be unique\n"
     "=======\nreplacement lines\n>>>>>>> REPLACE\n\n"
     "The first line of each block is the bare file path (like {path}), never the <file> tag. "
     "SEARCH must match the current file exactly once. A file tagged status=\"new\" does not exist yet: "
-    "create it with an empty SEARCH section. For simple file creation tasks, proceed directly with creating the target file without requesting clarification. No prose outside the blocks.\n"
+    "create it with an empty SEARCH section. To delete a provided file when the task asks for it, emit "
+    "{path}\n<<<<<<< DELETE\n>>>>>>> REPLACE\n(never empty a file as a substitute). For simple file creation tasks, proceed directly with creating the target file without requesting clarification. No prose outside the blocks.\n"
     "If the change also needs files that are not provided (e.g. callers of a changed signature), do not ask "
     "permission: emit a block for each of them with its project-relative path; the router hands the task to an "
     "agent that can edit them. Permission to edit more files is never a [NEEDS_CLARIFICATION]: that marker is "
@@ -334,6 +339,8 @@ def _ask(opts: TaskOptions, question: str, choices: str) -> str | None:
         try:
             answer = INPUT_FN(f"{question} ").strip().lower()[:1]
         except EOFError:
+            if INPUT_FN is input:
+                print()  # the unanswered prompt left the cursor mid-line
             return None
         if answer in choices:
             return answer
@@ -553,6 +560,8 @@ def score_task(cfg: Config, prompt: str, root: Path, targets: list[Path], conten
         lines = text.splitlines()
         if not full and len(lines) > _PREVIEW_HEAD + _PREVIEW_TAIL:
             text = "\n".join(lines[:_PREVIEW_HEAD] + ["..."] + lines[-_PREVIEW_TAIL:])
+        if not full and len(text) > (cap := cfg.scoring_full_content_max_tokens * 3):  # one huge line (minified, log)
+            text = text[:cap] + "\n..."
         views.append(f'<file path="{_rel(p, root)}">\n{text}\n</file>')
     user = (f"<task>\n{prompt}\n</task>\n<attached_files>\n{chr(10).join(views)}\n</attached_files>\n"
             f"<repo_map>\n{repo_map}\n</repo_map>")
@@ -1005,7 +1014,7 @@ def run_local(opts: TaskOptions, cfg: Config, ctx: TaskContext, prompt: str | No
                 out.message = f"write failed, patch reverted: {exc}"
                 break
             ever_written |= set(written)
-            result = verify(root, cfg, [rels[r] for r in written], baseline)
+            result = verify(root, cfg, [rels[r] for r in written if rels[r].exists()], baseline)
             if result.status == TaskStatus.TESTS_FAILED:
                 _revert_patch(rels, originals, written)
                 out.message = f"verification failed: {', '.join(result.new_failures)}"
@@ -1028,12 +1037,15 @@ def run_local(opts: TaskOptions, cfg: Config, ctx: TaskContext, prompt: str | No
     return out
 
 
-def _write_patch(rels: dict[str, Path], originals: dict[str, str | None], new: dict[str, str]) -> dict[str, str]:
-    """Write each file atomically; returns {rel: sha256 written}. On failure, reverts what was written."""
+def _write_patch(rels: dict[str, Path], originals: dict[str, str | None], new: dict[str, str | None]) -> dict[str, str]:
+    """Write each file atomically (`None` = delete); returns {rel: sha256 written, "" if deleted}. On failure, reverts."""
     written: dict[str, str] = {}
     try:
         for rel, text in new.items():
-            write_bytes_atomic(rels[rel], text.encode("utf-8"))
+            if text is None:
+                retry_win_lock(rels[rel].unlink)
+            else:
+                write_bytes_atomic(rels[rel], text.encode("utf-8"))
             written[rel] = file_sha256(rels[rel]) or ""
     except OSError:
         _revert_patch(rels, originals, written)
@@ -1044,7 +1056,7 @@ def _write_patch(rels: dict[str, Path], originals: dict[str, str | None], new: d
 def _revert_patch(rels: dict[str, Path], originals: dict[str, str | None], written: dict[str, str]) -> None:
     for rel, sha in written.items():
         path = rels[rel]
-        if file_sha256(path) != sha:  # someone edited it meanwhile: never clobber (Invariant #2)
+        if (file_sha256(path) or "") != sha:  # someone edited it meanwhile: never clobber (Invariant #2)
             print(f"⚠ {rel} changed during verification; not reverted", file=sys.stderr)
         elif originals[rel] is None:
             retry_win_lock(path.unlink)
@@ -1170,7 +1182,7 @@ def run_cloud(opts: TaskOptions, cfg: Config, ctx: TaskContext, decision: Decisi
     emit(opts, "checkpoint", checkpoint_id=cp.checkpoint_id)
     baseline = None if read_only or opts.strict_verification else \
         compute_baseline(root, cfg, [p for p in routing.target_files if p.exists()])
-    system_append = "\n\n".join(s for s in (ctx.profile, CLARIFICATION_DIRECTIVE, DATA_ONLY_DIRECTIVE,
+    system_append = "\n\n".join(s for s in (ctx.profile, CLARIFICATION_DIRECTIVE, DATA_ONLY_DIRECTIVE, NO_DELETE_DIRECTIVE,
                                             "" if read_only else SCOPE_DIRECTIVE, _directives(opts, routing)) if s)
     request = TaskRequest(task_id, prompt, root, decision.model, tuple(routing.target_files), context, system_append,
                           opts.verbose, read_only, resume_id, budget, disable_mcp=bool(project_secrets),
@@ -1342,7 +1354,7 @@ def _dispatch_loop(opts: TaskOptions, cfg: Config, ctx: TaskContext, decision: D
     while True:
         emit(opts, "routing", channel=decision.channel, model=decision.model, reason=decision.reason)
         if opts.verbose:
-            print(f"→ {decision.channel}/{decision.model or '-'}: {decision.reason} [routing: {ctx.routing.source}]",
+            print(f"→ {decision.channel}/{decision.model or '-'}: {decision.reason} [scoring: {ctx.routing.source}]",
                   file=sys.stderr)
         if decision.channel == "none":
             return Outcome(TaskStatus.QUOTA_EXHAUSTED, message=decision.reason)
@@ -1440,6 +1452,11 @@ def answers_pending_question(cfg: Config, opts: TaskOptions) -> bool:
         return True
 
 
+def _forced_cloud(opts: TaskOptions) -> bool:
+    """`--channel anthropic|agy` is an explicit choice: it beats the free local Q&A shortcut (never with --offline)."""
+    return opts.channel in ("anthropic", "agy") and not (opts.offline or is_offline())
+
+
 def _converse(opts: TaskOptions, cfg: Config, ctx: TaskContext) -> ExitCode:
     """Tier-0 chat answer: no checkpoint, no cloud, no patch."""
     decision = Decision("local", cfg.ollama_model, "conversational / direct Q&A [Tier-0 locale]")
@@ -1499,7 +1516,7 @@ def _run(opts: TaskOptions, cfg: Config) -> ExitCode:
         if opts.verbose:
             print(f"⚠ local_degraded: auto-reduced ollama_num_ctx to {cfg.ollama_num_ctx} (L03)", file=sys.stderr)
     # Conversational / Direct Q&A fast-path (Tier-0 locale, zero cloud costs)
-    if not opts.file_args and is_conversational_prompt(opts.prompt):
+    if not opts.file_args and not _forced_cloud(opts) and is_conversational_prompt(opts.prompt):
         blackboard, _ = load_blackboard(root)
         ctx = TaskContext(default_routing([]), {}, load_profile(cfg),
                           blackboard_context(blackboard), "", 0)
@@ -1562,7 +1579,7 @@ def _run(opts: TaskOptions, cfg: Config) -> ExitCode:
         ctx.routing.task_type = "debug"  # --fix is debugging by definition
     for p in ctx.routing.target_files:
         ctx.contents.setdefault(p, _read_text(p))
-    if ctx.routing.conversational and not opts.extra_directives:
+    if ctx.routing.conversational and not opts.extra_directives and not _forced_cloud(opts):
         return _converse(opts, cfg, ctx)  # a question the keyword fast path missed ("Puoi creare file?"); sees the named files
     ctx.tokens = _context_tokens(ctx, opts.prompt)
     if opts.offline and ctx.tokens > cfg.local_max_input_tokens:
@@ -1701,6 +1718,8 @@ def _continue(opts: TaskOptions, cfg: Config, ollama: OllamaStatus) -> ExitCode:
             c for c in (s.get("origin_checkpoint_id"), s.get("latest_checkpoint_id")) if c)]
         kwargs["extra_context"] = history + "\n<changes_so_far>\n" + "\n".join(d for d in diffs if d) + \
             "\n</changes_so_far>\nA previous agent session was interrupted; continue the original task."
+    if opts.dry_run:  # the REPL continues the last session on every line: --dry-run / /dry-run must still dispatch nothing
+        return _dry_run_report(opts, cfg, ctx, decision)
     try:
         with ProjectLock(root, task_id, cfg.lock_wait_timeout_s):
             outcome = dispatch(opts, cfg, ctx, decision, task_id, credit, **kwargs)
@@ -1720,7 +1739,7 @@ def _continue(opts: TaskOptions, cfg: Config, ollama: OllamaStatus) -> ExitCode:
 def _dry_run_report(opts: TaskOptions, cfg: Config, ctx: TaskContext, decision: Decision) -> ExitCode:
     root = opts.project_root
     routing = ctx.routing
-    print(f"→ {decision.channel}/{decision.model or '-'}: {decision.reason} [routing: {routing.source}]", file=sys.stderr)
+    print(f"→ {decision.channel}/{decision.model or '-'}: {decision.reason} [scoring: {routing.source}]", file=sys.stderr)
     say(opts, f"dry-run: no checkpoint, no dispatch\n  tokens≈{ctx.tokens}  depth={routing.reasoning_depth}  "
               f"scope={routing.files_scope}  type={routing.task_type}  repo-map≈{estimate_tokens(ctx.repo_map)} tokens")
     say(opts, f"  targets: {', '.join(_rel(p, root) for p in routing.target_files) or '(none)'}")
@@ -1842,7 +1861,7 @@ def show_status(root: Path, cfg: Config, as_json: bool = False) -> ExitCode:
     for name, factory in (("claude", _claude_adapter), ("agy", AntigravityAdapter)):
         try:
             info[name] = factory(cfg).probe()  # type: ignore[attr-defined]
-        except AdapterError as exc:
+        except (AdapterError, OfflineViolationError) as exc:  # /offline then /status must not kill the REPL
             info[name] = f"unavailable: {exc}"
     try:
         info["credit"] = CreditManager(cfg).summary()
@@ -1917,6 +1936,10 @@ def show_usage(cfg: Config, *, as_json: bool = False, sync_claude: float | None 
             return ExitCode.FAILED
         for cli in statusline.CLIS:
             print(f"  {statusline.install_hook(cli, exe)}", file=sys.stderr)
+    if not refresh and not as_json and not is_offline() and statusline.agy_refresh_due(cfg):
+        refresh = True  # a stale capture would show quotas that already reset
+        statusline.usage_dir().mkdir(parents=True, exist_ok=True)
+        (statusline.usage_dir() / "agy.refreshing").touch()
     if refresh:
         print("… opening agy without any prompt until its status line reports quotas", file=sys.stderr)
         try:
@@ -1936,6 +1959,8 @@ def show_usage(cfg: Config, *, as_json: bool = False, sync_claude: float | None 
             bucket, minutes = b_cooldown
             if bucket not in ("gemini", "argon", "claude_gpt"):
                 raise CreditError(f"unknown bucket {bucket!r} (gemini | argon | claude_gpt)")
+            if minutes < 0:
+                raise CreditError(f"implausible cooldown {minutes} min (0 clears it)")
             until = credit.mark_b_cooldown(bucket, "set manually from agy /usage", minutes)
             print(f"✔ bucket {bucket}: " + (f"cooldown until {until:%Y-%m-%d %H:%M} UTC" if minutes else "cleared"),
                   file=sys.stderr)
@@ -2000,7 +2025,7 @@ def undo(root: Path, cfg: Config, checkpoint_id: str | None, task_id: str | None
             _, s = find_session(bb, task_id)
         except SessionError as exc:
             say(opts, f"✖ {exc}")
-            return ExitCode.FAILED
+            return ExitCode.USAGE  # same as `-c --task-id`: an id that names nothing is a usage error
         ids = list(reversed(s.get("checkpoint_ids", [])))
         if not ids:
             say(opts, f"✖ task {task_id} has no checkpoints")

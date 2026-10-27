@@ -113,7 +113,7 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"(?:^|;)[ \t]*(?:password|pwd)[ \t]*=[ \t]*(?P<secret>[^;'\"\s$<{%]+)", re.I | re.M)),
 )
 _HIGH_ENTROPY_ASSIGNMENT = re.compile(
-    r"(?i)[\w.\-]*(?:secret|token|api[_\-]?key|passwd|password|credential)[\w.\-]*['\"]?[ \t]*[:=][ \t]*"
+    r"(?i)(?:secret|token|api[_\-]?key|passwd|password|credential)[\w.\-]{0,64}['\"]?[ \t]*[:=][ \t]*"  # bounded and unprefixed: unbounded [\w.\-]* made long words quadratic
     r"(?P<q>['\"])(?P<secret>[A-Za-z0-9+/=_\-]{20,})(?P=q)")
 _MIN_ENTROPY_BITS = 3.5
 
@@ -208,7 +208,7 @@ def validate_target_files(
     seen: set[str] = set()
     for raw in raw_paths:
         text = raw.strip()
-        if not text or "\0" in text:
+        if not text or "\0" in text or any(c in text for c in '<>"|?*'):  # NUL / Win32-illegal: never a real file
             raise PathValidationError(f"invalid target path {raw!r}")
         candidate = Path(text)
         if not candidate.is_absolute():

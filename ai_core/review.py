@@ -23,7 +23,8 @@ from ai_core.wsl import project_argv
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 _MAX_UNTRACKED_BYTES = 512 * 1024
-_RESERVED_TOKENS = 3000  # system prompt + model output headroom inside the local budget
+_CROSS_MAX_TOKENS = 150_000  # shortcut: one cloud prompt must fit a 200k context; chunk it if this ever bites
+_RESERVED_TOKENS = 3000# system prompt + model output headroom inside the local budget
 REVIEW_SYSTEM = (
     "You are a senior code reviewer. Review ONLY the diff: correctness bugs, security and trust-boundary "
     "issues, data loss, resource leaks, Windows pitfalls (paths, case, WinError 5/32, encodings), missing "
@@ -159,6 +160,10 @@ def _cross_review(root: Path, cfg: Config, diffs: list[tuple[str, str]], opts: T
     b = router.Decision("agy", cfg.agy_model_sonnet, "cross-review on Channel B")
     order = [a, b] if writer == "agy" else [b, a]  # the reviewer must not be the channel that wrote the code
     prompt = f"{REVIEW_SYSTEM}\n\n<diff>\n{''.join(d for _, d in diffs)}\n</diff>"
+    if (tokens := estimate_tokens(prompt)) > _CROSS_MAX_TOKENS:  # one prompt, no chunking: a real run cost $3.71 for nothing
+        router.say(opts, f"✖ diff too large for one cloud review (~{tokens} tokens > {_CROSS_MAX_TOKENS}): "
+                         "commit or stage less, or use --review (local, chunked)")
+        return ExitCode.USAGE
     out = _read_only_run(root, cfg, opts, prompt, order, "review")
     if out.adapter and out.adapter.result_text:
         router.say_md(opts, out.adapter.result_text.strip())
@@ -218,8 +223,11 @@ def review(root: Path, cfg: Config, mode: str, opts: TaskOptions, target: str | 
     except ReviewError as exc:
         router.say(opts, f"✖ {exc}")
         return ExitCode.USAGE
+    if target:  # a path (file or folder) narrows the review; ultra reads it as a ref/PR instead
+        want = target.replace("\\", "/").strip("/")
+        diffs = [(p, d) for p, d in diffs if p == want or p.startswith(want + "/")]
     if not diffs:
-        router.say(opts, "nothing to review: no changes against HEAD")
+        router.say(opts, f"nothing to review: no changes against HEAD{f' under {target}' if target else ''}")
         router.emit(opts, "review", mode=mode, report="", files=[])
         return ExitCode.OK
     if mode == "cross":
